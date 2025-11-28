@@ -230,15 +230,10 @@ class GeoanalyticsDownloader:
                             filename,
                         )
 
-                        raster_info = (
-                            asset.extra_fields.get("eo:bands", [{}]).get(
-                                "raster:bands"
-                            )[0]
-                            if asset.extra_fields.get("eo:bands")
-                            else {}
-                        )
-                        dtype = raster_info.get("data_type", None)
-                        nodata = raster_info.get("nodata", None)
+                        raster_bands = asset.extra_fields.get("raster:bands", [])
+                        raster_info = raster_bands[0] if raster_bands else {}
+                        dtype = raster_info.get("data_type")
+                        nodata = raster_info.get("nodata")
 
                         print(f"  Downloading asset {asset_key} to {target_path}")
                         try:
