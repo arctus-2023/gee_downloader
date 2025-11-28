@@ -32,74 +32,6 @@ STAC_COLLECTION_MAP = {
     "S1_L1C": "sentinel-1-grd",
 }
 
-EARTH_SEARCH_ASSET_MAP = {
-    "S2_L1TOA": {
-        "B01": "coastal",
-        "B02": "blue",
-        "B03": "green",
-        "B04": "red",
-        "B05": "rededge1",
-        "B06": "rededge2",
-        "B07": "rededge3",
-        "B08": "nir",
-        "B8A": "nir08",
-        "B09": "nir09",
-        "B10": "cirrus",
-        "B11": "swir16",
-        "B12": "swir22",
-        "QA60": "qa60",  # Stopped being generated 01-2022
-    },
-    "S2_L2SURF": {
-        "B01": "coastal",
-        "B02": "blue",
-        "B03": "green",
-        "B04": "red",
-        "B05": "rededge1",
-        "B06": "rededge2",
-        "B07": "rededge3",
-        "B08": "nir",
-        "B8A": "nir08",
-        "B09": "nir09",
-        "B11": "swir16",
-        "B12": "swir22",
-    },
-    "S2_L2RGB": {  # Collapse into single call to "visual"
-        "TCI_R": "visual",
-        "TCI_G": "visual",
-        "TCI_B": "visual",
-    },
-    "LC08_L1TOA": {
-        "B1": "coastal",
-        "B2": "blue",
-        "B3": "green",
-        "B4": "red",
-        "B5": "nir08",
-        "B6": "swir16",
-        "B7": "swir22",
-        "B8": "B8",
-        "B9": "cirrus",
-        "B10": "lwir11",
-        "B11": "lwir12",
-        "QA_PIXEL": "qa_pixel",
-        "QA_RADSAT": "qa_radsat",
-        "SAA": "saa",
-        "SZA": "sza",
-        "VAA": "vaa",
-        "VZA": "vza",
-    },
-    "LC08_L2RGB": {
-        "SR_B4": "red",
-        "SR_B3": "green",
-        "SR_B2": "blue",
-    },
-    "S1_L1C": {
-        "VV": "vv",
-        "VH": "vh",
-        "HH": "hh",
-        "HV": "hv",
-    },
-}
-
 ADLS_PREFIX = "01j9ajb2mdvmnkyhpahfevcy2t-sageport-main"
 
 
@@ -108,27 +40,7 @@ def _safe_split(value: str) -> List[str]:
 
 
 def _normalize_band_name(name: str) -> str:
-    candidate = name.strip().upper().replace("-", "_").replace(" ", "_")
-
-    for prefix in (
-        "SR_",
-        "ST_",
-        "OLI_",
-        "TIRS_",
-        "L2SP_",
-        "L2SR_",
-        "L1TP_",
-        "L1GT_",
-        "L1GS_",
-    ):
-        if candidate.startswith(prefix):
-            candidate = candidate[len(prefix) :]
-
-    if candidate.startswith("B") and len(candidate) > 1:
-        digits = candidate[1:]
-        if digits.isdigit():
-            candidate = f"B{int(digits)}"
-    return candidate
+    return name.strip().upper().replace("SR_", "").replace("B", "B")
 
 
 class GeoanalyticsDownloader:
@@ -173,7 +85,6 @@ class GeoanalyticsDownloader:
         self.cloud_threshold = float(self.global_config.get("cloud_percentage", 100))
         self.target = self.global_config.get("target", "all")
         self.asset_order = _safe_split(self.global_config.get("assets", ""))
-        self.override_map = self._load_overrides()
         io_config = IOConfig(
             adl_account=self.global_config.get("adl_account_name"),
         )
@@ -213,7 +124,7 @@ class GeoanalyticsDownloader:
                         print(f"  No STAC item found for {collection} on {date_str}")
                         continue
 
-                    matched_assets = self._match_assets(section, item, include_bands)
+                    matched_assets = self._match_assets(item, include_bands)
                     if not matched_assets:
                         print(f"  No matching assets found for {section} on {date_str}")
                         continue
@@ -229,25 +140,9 @@ class GeoanalyticsDownloader:
                             current_date.format("YYYYMMDD"),
                             filename,
                         )
-
-                        raster_info = (
-                            asset.extra_fields.get("eo:bands", [{}]).get(
-                                "raster:bands"
-                            )[0]
-                            if asset.extra_fields.get("eo:bands")
-                            else {}
-                        )
-                        dtype = raster_info.get("data_type", None)
-                        nodata = raster_info.get("nodata", None)
-
                         print(f"  Downloading asset {asset_key} to {target_path}")
                         try:
-                            self._copy_asset(
-                                asset.href,
-                                target_path,
-                                dtype,
-                                nodata,
-                            )
+                            self._copy_asset(asset.href, target_path)
                         except Exception as exc:
                             print(f"    Failed to copy {asset.href}: {exc}")
         finally:
@@ -322,149 +217,16 @@ class GeoanalyticsDownloader:
             yield current
             current = current.add(days=1)
 
-    def _build_asset_alias_map(self, section: str, item) -> dict[str, List[str]]:
-        """Construct a lookup that maps normalized band names to actual asset keys."""
-        alias_map: dict[str, List[str]] = {}
-
-        for asset_name, asset in item.assets.items():
-            normalized = _normalize_band_name(asset_name)
-            alias_map.setdefault(normalized, [])
-            if asset_name not in alias_map[normalized]:
-                alias_map[normalized].append(asset_name)
-
-            eo_bands = (
-                asset.extra_fields.get("eo:bands", [])
-                if hasattr(asset, "extra_fields")
-                else []
-            )
-            for band_info in eo_bands:
-                if isinstance(band_info, dict):
-                    eo_name = band_info.get("name")
-                    if eo_name:
-                        normalized_eo = _normalize_band_name(eo_name)
-                        alias_map.setdefault(normalized_eo, [])
-                        if asset_name not in alias_map[normalized_eo]:
-                            alias_map[normalized_eo].append(asset_name)
-                    common_name = band_info.get("common_name")
-                    if common_name:
-                        normalized_common = _normalize_band_name(common_name)
-                        alias_map.setdefault(normalized_common, [])
-                        if asset_name not in alias_map[normalized_common]:
-                            alias_map[normalized_common].append(asset_name)
-
-        dataset_mapping = EARTH_SEARCH_ASSET_MAP.get(section, {})
-        for source_name, alias in dataset_mapping.items():
-            source_norm = _normalize_band_name(source_name)
-            alias_norm = _normalize_band_name(alias)
-
-            source_assets = alias_map.get(source_norm, [])
-            alias_assets = alias_map.get(alias_norm, [])
-
-            if source_assets and not alias_assets:
-                alias_map[alias_norm] = list(source_assets)
-            elif alias_assets and not source_assets:
-                alias_map[source_norm] = list(alias_assets)
-            elif alias_assets and source_assets:
-                merged = source_assets + [
-                    asset for asset in alias_assets if asset not in source_assets
-                ]
-                alias_map[source_norm] = merged
-                alias_map[alias_norm] = list(merged)
-
-        self._apply_overrides(section, alias_map, item)
-
-        return alias_map
-
-    def _load_overrides(self) -> dict[str, dict[str, List[str]]]:
-        overrides: dict[str, dict[str, List[str]]] = {}
-        if "OVERRIDE" not in self.config:
-            return overrides
-
-        override_section = self.config["OVERRIDE"]
-        for raw_key, raw_value in override_section.items():
-            if "_" not in raw_key:
-                print(
-                    f"  Override entry '{raw_key}' is missing an underscore; expected format DATASET_BAND. Skipping."
-                )
-                continue
-
-            dataset_key, band_key = raw_key.rsplit("_", 1)
-            dataset_key = dataset_key.strip().upper()
-            normalized_band = _normalize_band_name(band_key)
-
-            if not dataset_key or not normalized_band:
-                print(
-                    f"  Override entry '{raw_key}' could not be parsed into dataset and band tokens. Skipping."
-                )
-                continue
-
-            asset_names = _safe_split(raw_value)
-            if not asset_names:
-                print(
-                    f"  Override entry '{raw_key}' does not specify any asset names. Skipping."
-                )
-                continue
-
-            overrides.setdefault(dataset_key, {})[normalized_band] = asset_names
-
-        return overrides
-
-    def _apply_overrides(
-        self, section: str, alias_map: dict[str, List[str]], item
-    ) -> None:
-        overrides = (
-            self.override_map.get(section.upper())
-            if hasattr(self, "override_map")
-            else None
-        )
-        if not overrides:
-            return
-
-        for band_name, preferred_assets in overrides.items():
-            resolved: List[str] = []
-            for candidate in preferred_assets:
-                asset_key = candidate.strip()
-                if not asset_key:
-                    continue
-
-                if asset_key in item.assets:
-                    if asset_key not in resolved:
-                        resolved.append(asset_key)
-                    continue
-
-                normalized_candidate = _normalize_band_name(asset_key)
-                for fallback in alias_map.get(normalized_candidate, []):
-                    if fallback not in resolved:
-                        resolved.append(fallback)
-
-            if not resolved:
-                print(
-                    f"  Override for {section} {band_name} did not match any available assets; leaving defaults in place."
-                )
-                continue
-
-            alias_map[band_name] = resolved
-
-    def _match_assets(self, section: str, item, include_bands: List[str]) -> List[str]:
-        """Resolve configured band names to available STAC asset keys for a dataset."""
+    def _match_assets(self, item, include_bands: List[str]) -> List[str]:
         if not include_bands:
             return list(item.assets.keys())
-
-        alias_map = self._build_asset_alias_map(section, item)
+        normalized_assets = {name.upper(): name for name in item.assets.keys()}
         matches: List[str] = []
-        seen: set[str] = set()
-
         for band in include_bands:
             normalized = _normalize_band_name(band)
-            for asset_name in alias_map.get(normalized, []):
-                if asset_name not in seen:
-                    matches.append(asset_name)
-                    seen.add(asset_name)
-
-        if matches:
-            return matches
-
-        return list(item.assets.keys())
+            if normalized in normalized_assets:
+                matches.append(normalized_assets[normalized])
+        return matches if matches else list(item.assets.keys())
 
     def _load_aoi_bbox(self, path: str) -> List[float]:
         with open(path, "r", encoding="utf-8") as fh:
@@ -518,10 +280,8 @@ class GeoanalyticsDownloader:
                 x_values.append(coord[0])
                 y_values.append(coord[1])
 
-    def _copy_asset(
-        self, href: str, target_path: str, dtype: str, nodata: float | None
-    ) -> None:
-        future = self.io_client.submit_copy(href, target_path, dtype, nodata)
+    def _copy_asset(self, href: str, target_path: str) -> None:
+        future = self.io_client.submit_copy(href, target_path)
         if future is not None:
             future.result()
 
@@ -529,7 +289,11 @@ class GeoanalyticsDownloader:
         self, asset_dir: str, anonym: str, date_token: str, filename: str
     ) -> str:
         normalized_dir = asset_dir.strip("/ ")
-        base = f"abfs://{ADLS_PREFIX}/{normalized_dir}/{anonym}/{date_token}"
+        if normalized_dir.upper() == "L1":
+            base = f"abfs://{ADLS_PREFIX}/{normalized_dir}/{anonym}/{date_token}"
+        else:
+            base = os.path.join(self.save_dir, normalized_dir, anonym, date_token)
+            Path(base).mkdir(parents=True, exist_ok=True)
 
         if base.startswith("abfs://"):
             return f"{base}/{filename}"
