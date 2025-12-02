@@ -24,8 +24,6 @@ STAC_ENDPOINTS = [
 STAC_COLLECTION_MAP = {
     "LC08_L1TOA": "landsat-8-l1",
     "LC08_L2RGB": "landsat-8-l2",
-    "LC09_L1TOA": "landsat-9-l1",
-    "LC09_L2RGB": "landsat-9-l2",
     "S2_L1TOA": "sentinel-2-l1c",
     "S2_L2RGB": "sentinel-2-l2a",
     "S2_L2SURF": "sentinel-2-l2a",
