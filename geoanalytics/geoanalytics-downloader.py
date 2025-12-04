@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import glob
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Iterable, List
 
@@ -101,6 +103,12 @@ EARTH_SEARCH_ASSET_MAP = {
 ADLS_PREFIX = "01j9ajb2mdvmnkyhpahfevcy2t-sageport-main"
 
 
+class DownloadDirIncompleteError(Exception):
+    """Raised when download directory has insufficient valid TIFFs."""
+
+    pass
+
+
 def _safe_split(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -129,6 +137,98 @@ def _normalize_band_name(name: str) -> str:
     return candidate
 
 
+def merge_tifs(
+    tifs: List[str],
+    output_f: str,
+    descriptions: str,
+    descriptions_meta: str,
+    bandnames: List[str] | None = None,
+    dst_crs=None,
+    RGB: bool = False,
+    min_max=(None, None),
+    **extra_info,
+):
+    """
+    Placeholder for merging multiple TIFFs into a single output file.
+
+    This function should be implemented based on your rasterio/gdal merge logic.
+    Returns: (status_code, crs) where status_code=1 means success.
+    """
+    # TODO: Implement actual merge logic using rasterio or gdal
+    print(f"  [MERGE] Would merge {len(tifs)} TIFFs into {output_f}")
+    print(f"  [MERGE] Descriptions: {descriptions}")
+    print(f"  [MERGE] Metadata: {descriptions_meta}")
+    print(f"  [MERGE] Band names: {bandnames}")
+    print(f"  [MERGE] CRS: {dst_crs}, RGB: {RGB}, min_max: {min_max}")
+
+    # Return success status and CRS
+    return 1, dst_crs
+
+
+def merge_download_dir(
+    download_dir: str,
+    output_f: str,
+    descriptions_meta: str,
+    descriptions: List[str],
+    dst_crs=None,
+    bandnames: List[str] | None = None,
+    remove_temp: bool = True,
+    RGB: bool = False,
+    min_max=(None, None),
+    **extra_info,
+):
+    """
+    Merge all TIFFs in download_dir into a single output file.
+
+    Args:
+        download_dir: Directory containing downloaded TIFF files
+        output_f: Output merged file path
+        descriptions_meta: Metadata description string
+        descriptions: List of band descriptions
+        dst_crs: Target coordinate reference system
+        bandnames: Optional list of band names
+        remove_temp: Whether to remove temp directory after successful merge
+        RGB: Whether this is an RGB composite
+        min_max: Min/max value tuple for scaling
+        **extra_info: Additional metadata to pass to merge
+
+    Returns:
+        dst_crs: The CRS used for the output
+
+    Raises:
+        DownloadDirIncompleteError: If no valid TIFFs found
+    """
+    # Filter for TIFFs matching pattern and minimum size (>20KB)
+    # Minimum size threshold may need adjustment based on resolution/grid size
+    tifs = [
+        p
+        for p in glob.glob(os.path.join(download_dir, "*_*_*.tif"))
+        if (os.path.getsize(p) / 1024.0) > 20
+    ]
+
+    if len(tifs) < 1:
+        raise DownloadDirIncompleteError(f"No valid TIFFs found in {download_dir}")
+
+    # Merge TIFFs into single output
+    ret, dst_crs = merge_tifs(
+        tifs,
+        output_f,
+        descriptions=":".join(descriptions),
+        descriptions_meta=descriptions_meta,
+        bandnames=bandnames,
+        dst_crs=dst_crs,
+        RGB=RGB,
+        min_max=min_max,
+        **extra_info,
+    )
+
+    # Clean up temporary directory if merge successful
+    if ret == 1 and remove_temp:
+        shutil.rmtree(download_dir)
+
+    return dst_crs
+
+
 class GeoanalyticsDownloader:
     def __init__(
         self,
@@ -137,6 +237,7 @@ class GeoanalyticsDownloader:
         aoi_path_override: str | None = None,
         start_date_override: str | None = None,
         end_date_override: str | None = None,
+        merge_outputs: bool = False,
     ):
         config = configparser.ConfigParser()
         config.read(config_path)
@@ -146,6 +247,7 @@ class GeoanalyticsDownloader:
         self.config = config
         self.global_config = config["GLOBAL"]
         self.dry_run = dry_run
+        self.merge_outputs = merge_outputs
 
         self.aoi_path = aoi_path_override or self.global_config.get("aoi") or ""
         if not self.aoi_path:
@@ -172,6 +274,13 @@ class GeoanalyticsDownloader:
         self.target = self.global_config.get("target", "all")
         self.asset_order = _safe_split(self.global_config.get("assets", ""))
         self.override_map = self._load_overrides()
+
+        # Merge configuration
+        self.merge_remove_temp = self.global_config.getboolean(
+            "merge_remove_temp", True
+        )
+        self.merge_output_dir = self.global_config.get("merge_output_dir", "merged")
+
         io_config = IOConfig(
             adl_account=self.global_config.get("adl_account_name"),
         )
@@ -199,9 +308,17 @@ class GeoanalyticsDownloader:
                 anonym = asset_config.get("anonym", section)
                 asset_savedir = asset_config.get("save_dir", "misc")
 
+                # Check if this section should be merged
+                should_merge = self.merge_outputs or asset_config.getboolean(
+                    "merge", False
+                )
+                is_rgb = section.endswith("RGB")
+
                 for current_date in self._iter_dates():
                     date_str = current_date.format("YYYY-MM-DD")
+                    date_token = current_date.format("YYYYMMDD")
                     print(f"Processing {section} for {date_str}")
+
                     if self.dry_run:
                         print(f"  [dry-run] would search {collection} for {date_str}")
                         continue
@@ -216,17 +333,30 @@ class GeoanalyticsDownloader:
                         print(f"  No matching assets found for {section} on {date_str}")
                         continue
 
+                    # Track downloaded files for potential merging
+                    downloaded_files = []
+                    download_dir = None
+
                     for asset_key in matched_assets:
                         asset = item.assets[asset_key]
                         suffix = Path(asset.href).suffix or ".dat"
                         proposal = asset_key.replace("/", "_")
                         filename = f"{section}_{date_str}_{proposal}_{self.aoi_name}_{resolution}m{suffix}"
-                        target_path = self._build_target_path(
-                            asset_savedir,
-                            anonym,
-                            current_date.format("YYYYMMDD"),
-                            filename,
-                        )
+
+                        # If merging, use temporary download directory
+                        if should_merge:
+                            if download_dir is None:
+                                download_dir = self._build_download_dir(
+                                    asset_savedir, anonym, date_token
+                                )
+                            target_path = os.path.join(download_dir, filename)
+                        else:
+                            target_path = self._build_target_path(
+                                asset_savedir,
+                                anonym,
+                                date_token,
+                                filename,
+                            )
 
                         raster_bands = asset.extra_fields.get("raster:bands", [])
                         raster_info = raster_bands[0] if raster_bands else {}
@@ -241,8 +371,50 @@ class GeoanalyticsDownloader:
                                 dtype,
                                 nodata,
                             )
+                            if should_merge:
+                                downloaded_files.append(target_path)
                         except Exception as exc:
                             print(f"    Failed to copy {asset.href}: {exc}")
+
+                    # Perform merge if enabled and files were downloaded
+                    if should_merge and downloaded_files and download_dir:
+                        try:
+                            merged_filename = f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.tif"
+                            merged_path = self._build_target_path(
+                                self.merge_output_dir,
+                                anonym,
+                                date_token,
+                                merged_filename,
+                            )
+
+                            print(
+                                f"  Merging {len(downloaded_files)} files into {merged_path}"
+                            )
+
+                            # Get band names from matched assets
+                            bandnames = [
+                                asset.replace("/", "_") for asset in matched_assets
+                            ]
+
+                            merge_download_dir(
+                                download_dir=download_dir,
+                                output_f=merged_path,
+                                descriptions_meta=f"{section}_{date_str}_{self.aoi_name}",
+                                descriptions=bandnames,
+                                bandnames=bandnames,
+                                dst_crs=None,  # Can be configured in INI
+                                remove_temp=self.merge_remove_temp,
+                                RGB=is_rgb,
+                                min_max=(None, None),
+                                collection=collection,
+                                date=date_str,
+                            )
+                            print(f"  Merge complete: {merged_path}")
+                        except DownloadDirIncompleteError as exc:
+                            print(f"  Merge failed: {exc}")
+                        except Exception as exc:
+                            print(f"  Merge error: {exc}")
+
         finally:
             self.io_client.close()
 
@@ -256,9 +428,7 @@ class GeoanalyticsDownloader:
                 print(f"  Could not open STAC endpoint {endpoint}: {exc}")
                 continue
 
-            # Try preferred search (with sorting by eo:cloud_cover). Some
-            # collections do not expose that property and the backend will
-            # return a BadRequest. In that case we fall back to looser queries.
+            # Try preferred search (with sorting by eo:cloud_cover)
             try:
                 search = client.search(
                     collections=[collection],
@@ -275,10 +445,10 @@ class GeoanalyticsDownloader:
                 print(
                     f"  STAC endpoint {endpoint} rejected sort/query: {exc}. Retrying without sort..."
                 )
-            except Exception as exc:  # unexpected errors
+            except Exception as exc:
                 print(f"  STAC search failed at {endpoint}: {exc}")
 
-            # Fallback 1: try without sort (keep cloud cover filter)
+            # Fallback 1: try without sort
             try:
                 search = client.search(
                     collections=[collection],
@@ -293,7 +463,7 @@ class GeoanalyticsDownloader:
             except Exception as exc:
                 print(f"  STAC fallback (no-sort) failed at {endpoint}: {exc}")
 
-            # Fallback 2: try without query (some indices may not index eo:cloud_cover)
+            # Fallback 2: try without query
             try:
                 search = client.search(
                     collections=[collection],
@@ -528,6 +698,13 @@ class GeoanalyticsDownloader:
             return f"{base}/{filename}"
         return os.path.join(base, filename)
 
+    def _build_download_dir(self, asset_dir: str, anonym: str, date_token: str) -> str:
+        """Create temporary download directory for files to be merged."""
+        normalized_dir = asset_dir.strip("/ ")
+        temp_dir = f"temp_downloads/{normalized_dir}/{anonym}/{date_token}"
+        os.makedirs(temp_dir, exist_ok=True)
+        return temp_dir
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -546,6 +723,9 @@ def main() -> None:
         "--start-date", help="Optional override start date (YYYY-MM-DD)"
     )
     parser.add_argument("--end-date", help="Optional override end date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--merge", action="store_true", help="Merge downloaded bands into single files"
+    )
 
     args = parser.parse_args()
     downloader = GeoanalyticsDownloader(
@@ -554,6 +734,7 @@ def main() -> None:
         aoi_path_override=args.aoi,
         start_date_override=args.start_date,
         end_date_override=args.end_date,
+        merge_outputs=args.merge,
     )
     downloader.run()
 
