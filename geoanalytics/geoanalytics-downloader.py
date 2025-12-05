@@ -15,6 +15,13 @@ import pendulum
 from geoanalytics_io_client import GeoanalyticsIOClient, IOConfig
 from pystac_client import Client
 from pystac_client.exceptions import APIError
+from utils import (
+    merge_downloaded_assets_to_cog,
+    merge_downloaded_assets_to_zarr,
+    open_or_create_zarr_store,
+    write_band_to_zarr_group,
+    write_merged_to_zarr_group,
+)
 
 STAC_ENDPOINTS = [
     "https://earth-search.aws.element84.com/v1",
@@ -172,10 +179,62 @@ class GeoanalyticsDownloader:
         self.target = self.global_config.get("target", "all")
         self.asset_order = _safe_split(self.global_config.get("assets", ""))
         self.override_map = self._load_overrides()
+
+        # Merge configuration
+        self.merge_outputs = (
+            self.global_config.get("merge_outputs", "false").lower() == "true"
+        )
+        self.temp_download_dir = self.global_config.get("temp_download_dir", "")
+
+        # Output format: "cog" (default) or "zarr"
+        self.output_format = self.global_config.get("output_format", "cog").lower()
+        if self.output_format not in ("cog", "zarr"):
+            raise ValueError(
+                f"output_format must be 'cog' or 'zarr', got '{self.output_format}'"
+            )
+
+        # Zarr-specific settings
+        self.zarr_chunks = self._parse_chunks(
+            self.global_config.get("zarr_chunks", "1,512,512")
+        )
+
+        # Hierarchical Zarr mode: single store with groups per scene
+        # If True, creates structure: <collection>.zarr/<date>/bands/ and <date>/merged/
+        self.hierarchical_zarr = (
+            self.global_config.get("hierarchical_zarr", "false").lower() == "true"
+        )
+
+        # Whether to write individual bands to Zarr (only used in hierarchical mode)
+        self.write_individual_bands = (
+            self.global_config.get("write_individual_bands", "true").lower() == "true"
+        )
+
+        # Path to the root Zarr store (only used in hierarchical mode)
+        # If not set, will be derived from save_dir and collection name
+        self.zarr_store_path = self.global_config.get("zarr_store_path", "")
+
         io_config = IOConfig(
             adl_account=self.global_config.get("adl_account_name"),
         )
         self.io_client = GeoanalyticsIOClient(io_config)
+
+    def _parse_chunks(self, chunks_str: str) -> tuple[int, int, int]:
+        """Parse chunk size string like '1,512,512' into a tuple."""
+        try:
+            parts = [int(x.strip()) for x in chunks_str.split(",")]
+            if len(parts) == 3:
+                return tuple(parts)
+            elif len(parts) == 2:
+                return (1, parts[0], parts[1])
+            elif len(parts) == 1:
+                return (1, parts[0], parts[0])
+            else:
+                raise ValueError("Too many values")
+        except Exception:
+            print(
+                f"  Warning: Could not parse zarr_chunks '{chunks_str}', using default (1, 512, 512)"
+            )
+            return (1, 512, 512)
 
     def run(self) -> None:
         print("Starting Geoanalytics download workflow")
@@ -199,6 +258,12 @@ class GeoanalyticsDownloader:
                 anonym = asset_config.get("anonym", section)
                 asset_savedir = asset_config.get("save_dir", "misc")
 
+                # Check if this section should merge outputs
+                section_merge = asset_config.get("merge_outputs", "").lower()
+                should_merge = section_merge == "true" or (
+                    section_merge == "" and self.merge_outputs
+                )
+
                 for current_date in self._iter_dates():
                     date_str = current_date.format("YYYY-MM-DD")
                     print(f"Processing {section} for {date_str}")
@@ -216,35 +281,338 @@ class GeoanalyticsDownloader:
                         print(f"  No matching assets found for {section} on {date_str}")
                         continue
 
-                    for asset_key in matched_assets:
-                        asset = item.assets[asset_key]
-                        suffix = Path(asset.href).suffix or ".dat"
-                        proposal = asset_key.replace("/", "_")
-                        filename = f"{section}_{date_str}_{proposal}_{self.aoi_name}_{resolution}m{suffix}"
-                        target_path = self._build_target_path(
-                            asset_savedir,
-                            anonym,
-                            current_date.format("YYYYMMDD"),
-                            filename,
+                    if should_merge:
+                        # Download to temp directory and merge
+                        self._download_and_merge_assets(
+                            section=section,
+                            item=item,
+                            matched_assets=matched_assets,
+                            asset_savedir=asset_savedir,
+                            anonym=anonym,
+                            current_date=current_date,
+                            resolution=resolution,
+                            include_bands=include_bands,
                         )
-
-                        raster_bands = asset.extra_fields.get("raster:bands", [])
-                        raster_info = raster_bands[0] if raster_bands else {}
-                        dtype = raster_info.get("data_type")
-                        nodata = raster_info.get("nodata")
-
-                        print(f"  Downloading asset {asset_key} to {target_path}")
-                        try:
-                            self._copy_asset(
-                                asset.href,
-                                target_path,
-                                dtype,
-                                nodata,
-                            )
-                        except Exception as exc:
-                            print(f"    Failed to copy {asset.href}: {exc}")
+                    else:
+                        # Original behavior: download each asset separately
+                        self._download_assets_individually(
+                            section=section,
+                            item=item,
+                            matched_assets=matched_assets,
+                            asset_savedir=asset_savedir,
+                            anonym=anonym,
+                            current_date=current_date,
+                            resolution=resolution,
+                        )
         finally:
             self.io_client.close()
+
+    def _download_assets_individually(
+        self,
+        section: str,
+        item,
+        matched_assets: List[str],
+        asset_savedir: str,
+        anonym: str,
+        current_date: pendulum.DateTime,
+        resolution: int,
+    ) -> None:
+        """Download each asset as a separate file (original behavior)."""
+        date_str = current_date.format("YYYY-MM-DD")
+        for asset_key in matched_assets:
+            asset = item.assets[asset_key]
+            suffix = Path(asset.href).suffix or ".dat"
+            proposal = asset_key.replace("/", "_")
+            filename = (
+                f"{section}_{date_str}_{proposal}_{self.aoi_name}_{resolution}m{suffix}"
+            )
+            target_path = self._build_target_path(
+                asset_savedir,
+                anonym,
+                current_date.format("YYYYMMDD"),
+                filename,
+            )
+
+            raster_bands = asset.extra_fields.get("raster:bands", [])
+            raster_info = raster_bands[0] if raster_bands else {}
+            dtype = raster_info.get("data_type")
+            nodata = raster_info.get("nodata")
+
+            print(f"  Downloading asset {asset_key} to {target_path}")
+            try:
+                self._copy_asset(
+                    asset.href,
+                    target_path,
+                    dtype,
+                    nodata,
+                )
+            except Exception as exc:
+                print(f"    Failed to copy {asset.href}: {exc}")
+
+    def _download_and_merge_assets(
+        self,
+        section: str,
+        item,
+        matched_assets: List[str],
+        asset_savedir: str,
+        anonym: str,
+        current_date: pendulum.DateTime,
+        resolution: int,
+        include_bands: List[str],
+    ) -> None:
+        """Download assets to temp directory and merge into a single file (COG or Zarr)."""
+        import shutil
+
+        date_str = current_date.format("YYYY-MM-DD")
+
+        # Check for section-level output format override
+        section_format = ""
+        if section in self.config:
+            section_format = self.config[section].get("output_format", "").lower()
+        output_format = (
+            section_format if section_format in ("cog", "zarr") else self.output_format
+        )
+
+        # Check for hierarchical Zarr mode
+        section_hierarchical = self.config[section].get("hierarchical_zarr", "").lower()
+        use_hierarchical = section_hierarchical == "true" or (
+            section_hierarchical == "" and self.hierarchical_zarr
+        )
+
+        # Create temp directory for downloads
+        if self.temp_download_dir:
+            temp_base = Path(self.temp_download_dir)
+            temp_base.mkdir(parents=True, exist_ok=True)
+            temp_dir = temp_base / f"{section}_{date_str}_{self.aoi_name}"
+            temp_dir.mkdir(exist_ok=True)
+            temp_dir_path = str(temp_dir)
+        else:
+            import tempfile
+
+            temp_dir_path = tempfile.mkdtemp(prefix=f"{section}_{date_str}_")
+
+        downloaded_files: List[str] = []
+        bandnames: List[str] = []
+
+        # Get item metadata for attributes (needed early for hierarchical mode)
+        item_id = item.id if hasattr(item, "id") else "unknown"
+        cloud_pct = (
+            item.properties.get("eo:cloud_cover", None)
+            if hasattr(item, "properties")
+            else None
+        )
+
+        # For hierarchical mode, set up the store path early
+        store_path = None
+        scene_id = None
+        if use_hierarchical and output_format == "zarr":
+            scene_id = current_date.format("YYYYMMDD")
+            if self.zarr_store_path:
+                store_path = self.zarr_store_path
+            else:
+                store_filename = f"{section}_{self.aoi_name}_{resolution}m.zarr"
+                store_path = self._build_target_path(
+                    asset_savedir, anonym, "", store_filename
+                ).rstrip("/")
+
+            # Ensure the store exists
+            print(f"  Opening/creating Zarr store: {store_path}")
+            open_or_create_zarr_store(store_path, self.io_client, mode="a")
+
+        try:
+            print(f"  Downloading {len(matched_assets)} assets...")
+
+            for asset_key in matched_assets:
+                asset = item.assets[asset_key]
+                suffix = Path(asset.href).suffix or ".tif"
+                # Ensure we're working with tif for merging
+                if suffix.lower() in (".jp2", ".jpx", ".jpeg2000"):
+                    suffix = ".tif"
+
+                local_filename = f"{asset_key.replace('/', '_')}{suffix}"
+                local_path = os.path.join(temp_dir_path, local_filename)
+
+                raster_bands = asset.extra_fields.get("raster:bands", [])
+                raster_info = raster_bands[0] if raster_bands else {}
+                dtype = raster_info.get("data_type")
+                nodata = raster_info.get("nodata")
+
+                print(f"    Downloading {asset_key}...")
+                try:
+                    # Download to local temp file (convert to GeoTIFF in process)
+                    self._download_to_local(
+                        asset.href,
+                        local_path,
+                        dtype,
+                        nodata,
+                    )
+                    if (
+                        os.path.exists(local_path)
+                        and os.path.getsize(local_path) > 1024
+                    ):
+                        downloaded_files.append(local_path)
+                        bandnames.append(asset_key)
+
+                        # Hierarchical mode: write band to Zarr immediately after download
+                        if (
+                            use_hierarchical
+                            and output_format == "zarr"
+                            and self.write_individual_bands
+                        ):
+                            print(f"      Writing {asset_key} to Zarr...")
+                            try:
+                                write_band_to_zarr_group(
+                                    tif_path=local_path,
+                                    store_path=store_path,
+                                    group_path=f"{scene_id}/bands",
+                                    band_name=asset_key,
+                                    io_client=self.io_client,
+                                    chunks=(self.zarr_chunks[1], self.zarr_chunks[2]),
+                                    stac_item_id=item_id,
+                                    date=date_str,
+                                    cloud_cover=cloud_pct,
+                                )
+                            except Exception as band_exc:
+                                print(
+                                    f"      Warning: Failed to write band to Zarr: {band_exc}"
+                                )
+
+                except Exception as exc:
+                    print(f"      Failed to download {asset.href}: {exc}")
+
+            if not downloaded_files:
+                print(
+                    f"  No assets successfully downloaded for {section} on {date_str}"
+                )
+                return
+
+            # Hierarchical Zarr mode: now create the merged group from downloaded files
+            if use_hierarchical and output_format == "zarr":
+                print(f"  Creating merged group from {len(downloaded_files)} bands...")
+                try:
+                    write_merged_to_zarr_group(
+                        tif_files=downloaded_files,
+                        store_path=store_path,
+                        group_path=f"{scene_id}/merged",
+                        io_client=self.io_client,
+                        bandnames=bandnames,
+                        chunks=self.zarr_chunks,
+                        stac_item_id=item_id,
+                        date=date_str,
+                        cloud_cover=cloud_pct,
+                        aoi=self.aoi_name,
+                        resolution=resolution,
+                    )
+                    print(f"  Successfully ingested scene to {store_path}/{scene_id}/")
+                except Exception as exc:
+                    print(f"  Failed to create merged group: {exc}")
+                    raise
+            else:
+                # Original mode: separate file per scene
+                self._merge_to_single_file(
+                    section=section,
+                    downloaded_files=downloaded_files,
+                    bandnames=bandnames,
+                    asset_savedir=asset_savedir,
+                    anonym=anonym,
+                    current_date=current_date,
+                    resolution=resolution,
+                    output_format=output_format,
+                    item_id=item_id,
+                    cloud_pct=cloud_pct,
+                )
+
+        finally:
+            # Clean up temp directory
+            if os.path.exists(temp_dir_path):
+                shutil.rmtree(temp_dir_path, ignore_errors=True)
+
+    def _merge_to_single_file(
+        self,
+        section: str,
+        downloaded_files: List[str],
+        bandnames: List[str],
+        asset_savedir: str,
+        anonym: str,
+        current_date: pendulum.DateTime,
+        resolution: int,
+        output_format: str,
+        item_id: str,
+        cloud_pct: float | None,
+    ) -> None:
+        """Merge downloaded files into a single output file (original behavior)."""
+        date_str = current_date.format("YYYY-MM-DD")
+
+        # Build output path for merged file
+        if output_format == "zarr":
+            merged_filename = (
+                f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.zarr"
+            )
+        else:
+            merged_filename = (
+                f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.tif"
+            )
+
+        merged_target_path = self._build_target_path(
+            asset_savedir,
+            anonym,
+            current_date.format("YYYYMMDD"),
+            merged_filename,
+        )
+
+        print(
+            f"  Merging {len(downloaded_files)} files into {merged_target_path} (format: {output_format})..."
+        )
+
+        try:
+            descriptions = f"{section}:{date_str}:{item_id}"
+
+            if output_format == "zarr":
+                merge_downloaded_assets_to_zarr(
+                    tif_files=downloaded_files,
+                    output_path=merged_target_path,
+                    io_client=self.io_client,
+                    bandnames=bandnames,
+                    descriptions=descriptions,
+                    chunks=self.zarr_chunks,
+                    remove_temp=False,
+                    cloud_percentage=cloud_pct,
+                )
+            else:
+                merge_downloaded_assets_to_cog(
+                    tif_files=downloaded_files,
+                    output_path=merged_target_path,
+                    io_client=self.io_client,
+                    bandnames=bandnames,
+                    descriptions=descriptions,
+                    remove_temp=False,
+                    cloud_percentage=cloud_pct,
+                )
+            print(f"  Successfully merged and uploaded to {merged_target_path}")
+        except Exception as exc:
+            print(f"  Failed to merge assets: {exc}")
+            raise
+
+    def _download_to_local(
+        self, href: str, local_path: str, dtype: str, nodata: float | None
+    ) -> None:
+        """Download a remote asset to a local file, converting to GeoTIFF if needed."""
+        import fsspec
+        import rioxarray as rxr
+
+        reader_opts = self.io_client._storage_options(href)
+
+        with fsspec.open(href, "rb", **reader_opts) as reader_file:
+            with rxr.open_rasterio(reader_file) as dataset:
+                # Handle nodata and dtype
+                if nodata is not None:
+                    dataset = dataset.rio.set_nodata(nodata)
+                    dataset = dataset.rio.write_nodata(nodata, encoded=True)
+                if dtype:
+                    dataset = dataset.astype(dtype)
+
+                # Write as GeoTIFF
+                dataset.rio.to_raster(local_path, driver="GTiff")
 
     def _find_stac_item(self, collection: str, date: pendulum.DateTime):
         period = f"{date.format('YYYY-MM-DD')}/{date.add(days=1).format('YYYY-MM-DD')}"
