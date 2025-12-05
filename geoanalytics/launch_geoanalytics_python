@@ -1,0 +1,1 @@
+python geoanalytics/geoanalytics-downloader.py --config geoanalytics/geoanalytics-download.ini --aoi geoanalytics/R-15-D.geojson --merge
