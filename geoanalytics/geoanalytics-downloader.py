@@ -438,6 +438,16 @@ class GeoanalyticsDownloader:
             print(f"  Downloading {len(matched_assets)} assets...")
 
             for asset_key in matched_assets:
+                if asset_key.endswith("-jp2") or asset_key.endswith("-jpx"):
+                    print(
+                        f"    Skipping asset {asset_key} (JPEG2000 assets not supported for download)"
+                    )
+                    continue
+                if "RGB" in section.upper() and "visual" in asset_key:
+                    print(
+                        f"    Skipping asset {asset_key} (RGB assets not supported for download)"
+                    )
+                    continue
                 asset = item.assets[asset_key]
                 suffix = Path(asset.href).suffix or ".tif"
                 # Ensure we're working with tif for merging
@@ -842,7 +852,15 @@ class GeoanalyticsDownloader:
 
         for band in include_bands:
             normalized = _normalize_band_name(band)
+            if "visual" in normalized and "RGB" not in section.upper():
+                continue
             for asset_name in alias_map.get(normalized, []):
+                if asset_name.endswith("-jp2") or asset_name.endswith("-jpx"):
+                    continue
+                if "RGB" not in section.upper() and (
+                    "visual" in asset_name or "visual" in normalized
+                ):
+                    continue
                 if asset_name not in seen:
                     matches.append(asset_name)
                     seen.add(asset_name)
