@@ -154,16 +154,31 @@ class GeoanalyticsDownloader:
         self.global_config = config["GLOBAL"]
         self.dry_run = dry_run
 
+        io_config = IOConfig(
+            adl_account=self.global_config.get("adl_account_name"),
+        )
+        self.io_client = GeoanalyticsIOClient(io_config)
+
         self.aoi_path = aoi_path_override or self.global_config.get("aoi") or ""
         if not self.aoi_path:
             raise ValueError(
                 "AOI path must be defined either in GLOBAL section or via --aoi"
             )
-        if not Path(self.aoi_path).exists():
+        if not Path(self.aoi_path).exists() and not (
+            self.aoi_path.startswith("abfs://") or self.aoi_path.startswith("az://")
+        ):
             raise FileNotFoundError(f"AOI file not found: {self.aoi_path}")
+        elif self.aoi_path.startswith("abfs://"):
+            self.aoi_name = Path(self.aoi_path.split("/")[-1]).stem
+            self.bbox = self.io_client.load_remote_aoi(self.aoi_path)
+        else:
+            self.aoi_path = str(Path(self.aoi_path).resolve())
+            self.aoi_name = Path(self.aoi_path).stem
+            self.bbox = self._load_aoi_bbox(self.aoi_path)
 
-        self.aoi_name = Path(self.aoi_path).stem
-        self.bbox = self._load_aoi_bbox(self.aoi_path)
+        self.clip_to_aoi = (
+            self.global_config.get("clip_to_aoi", "false").lower() == "true"
+        )
 
         self.start_date = pendulum.parse(
             start_date_override or self.global_config.get("start_date")
@@ -212,11 +227,6 @@ class GeoanalyticsDownloader:
         # Path to the root Zarr store (only used in hierarchical mode)
         # If not set, will be derived from save_dir and collection name
         self.zarr_store_path = self.global_config.get("zarr_store_path", "")
-
-        io_config = IOConfig(
-            adl_account=self.global_config.get("adl_account_name"),
-        )
-        self.io_client = GeoanalyticsIOClient(io_config)
 
     def _parse_chunks(self, chunks_str: str) -> tuple[int, int, int]:
         """Parse chunk size string like '1,512,512' into a tuple."""
@@ -292,6 +302,7 @@ class GeoanalyticsDownloader:
                             current_date=current_date,
                             resolution=resolution,
                             include_bands=include_bands,
+                            clip_aoi=self.clip_to_aoi,
                         )
                     else:
                         # Original behavior: download each asset separately
@@ -303,6 +314,7 @@ class GeoanalyticsDownloader:
                             anonym=anonym,
                             current_date=current_date,
                             resolution=resolution,
+                            clip_aoi=self.clip_to_aoi,
                         )
         finally:
             self.io_client.close()
@@ -316,6 +328,7 @@ class GeoanalyticsDownloader:
         anonym: str,
         current_date: pendulum.DateTime,
         resolution: int,
+        clip_aoi: bool,
     ) -> None:
         """Download each asset as a separate file (original behavior)."""
         date_str = current_date.format("YYYY-MM-DD")
@@ -345,6 +358,7 @@ class GeoanalyticsDownloader:
                     target_path,
                     dtype,
                     nodata,
+                    clip_aoi,
                 )
             except Exception as exc:
                 print(f"    Failed to copy {asset.href}: {exc}")
@@ -359,6 +373,7 @@ class GeoanalyticsDownloader:
         current_date: pendulum.DateTime,
         resolution: int,
         include_bands: List[str],
+        clip_aoi: bool = False,
     ) -> None:
         """Download assets to temp directory and merge into a single file (COG or Zarr)."""
         import shutil
@@ -489,6 +504,8 @@ class GeoanalyticsDownloader:
             # Hierarchical Zarr mode: now create the merged group from downloaded files
             if use_hierarchical and output_format == "zarr":
                 print(f"  Creating merged group from {len(downloaded_files)} bands...")
+                # Determine clip_bbox for this operation
+                clip_bbox = self.bbox if clip_aoi else None
                 try:
                     write_merged_to_zarr_group(
                         tif_files=downloaded_files,
@@ -497,6 +514,7 @@ class GeoanalyticsDownloader:
                         io_client=self.io_client,
                         bandnames=bandnames,
                         chunks=self.zarr_chunks,
+                        clip_bbox=clip_bbox,
                         stac_item_id=item_id,
                         date=date_str,
                         cloud_cover=cloud_pct,
@@ -520,6 +538,7 @@ class GeoanalyticsDownloader:
                     output_format=output_format,
                     item_id=item_id,
                     cloud_pct=cloud_pct,
+                    clip_aoi=clip_aoi,
                 )
 
         finally:
@@ -539,9 +558,13 @@ class GeoanalyticsDownloader:
         output_format: str,
         item_id: str,
         cloud_pct: float | None,
+        clip_aoi: bool = False,
     ) -> None:
         """Merge downloaded files into a single output file (original behavior)."""
         date_str = current_date.format("YYYY-MM-DD")
+
+        # Determine clip_bbox from clip_aoi flag
+        clip_bbox = self.bbox if clip_aoi else None
 
         # Build output path for merged file
         if output_format == "zarr":
@@ -577,6 +600,7 @@ class GeoanalyticsDownloader:
                     chunks=self.zarr_chunks,
                     remove_temp=False,
                     cloud_percentage=cloud_pct,
+                    clip_bbox=clip_bbox,
                 )
             else:
                 merge_downloaded_assets_to_cog(
@@ -587,6 +611,7 @@ class GeoanalyticsDownloader:
                     descriptions=descriptions,
                     remove_temp=False,
                     cloud_percentage=cloud_pct,
+                    clip_bbox=clip_bbox,
                 )
             print(f"  Successfully merged and uploaded to {merged_target_path}")
         except Exception as exc:
@@ -880,9 +905,16 @@ class GeoanalyticsDownloader:
                 y_values.append(coord[1])
 
     def _copy_asset(
-        self, href: str, target_path: str, dtype: str, nodata: float | None
+        self,
+        href: str,
+        target_path: str,
+        dtype: str,
+        nodata: float | None,
+        clip_aoi: bool = False,
     ) -> None:
-        future = self.io_client.submit_copy(href, target_path, dtype, nodata)
+        # Pass the AOI bounding box when clipping is enabled
+        clip_bbox = self.bbox if clip_aoi else None
+        future = self.io_client.submit_copy(href, target_path, dtype, nodata, clip_bbox)
         if future is not None:
             future.result()
 

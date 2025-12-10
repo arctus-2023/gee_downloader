@@ -7,11 +7,12 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import fsspec
 from azure.storage.blob import ContentSettings
 from fsspec.core import split_protocol
+from shapely.geometry import box, shape
 
 try:
     from azure.identity.aio import DefaultAzureCredential
@@ -37,12 +38,54 @@ class GeoanalyticsIOClient:
     def close(self) -> None:
         pass
 
+    def load_remote_aoi(self, path: str) -> List[float]:
+        """Load a remote AOI file to get bounding box."""
+        # Verify remote source path is prefixes with abfs or az and exists
+        reader_opts = self._storage_options(path)
+        with fsspec.open(path, "r", **reader_opts) as fh:
+            import json
+
+            data = json.load(fh)
+        features = []
+        if "features" in data:
+            features = data["features"]
+        elif "geometry" in data:
+            features = [data]
+        else:
+            raise ValueError("Invalid AOI file format")
+        if not features:
+            raise ValueError("No features found in AOI file")
+        # Compute bounding box
+        minx, miny, maxx, maxy = None, None, None, None
+        for feature in features:
+            geom = shape(feature["geometry"])
+            bbox = box(*geom.bounds)
+            if minx is None:
+                minx, miny, maxx, maxy = bbox.bounds
+            else:
+                minx = min(minx, bbox.bounds[0])
+                miny = min(miny, bbox.bounds[1])
+                maxx = max(maxx, bbox.bounds[2])
+                maxy = max(maxy, bbox.bounds[3])
+        if minx is None:
+            raise ValueError("Could not compute bounding box from AOI features")
+        return [minx, miny, maxx, maxy]
+
     def submit_copy(
-        self, src: str, dest: str, dtype: str, nodata: float | None
+        self,
+        src: str,
+        dest: str,
+        dtype: str,
+        nodata: float | None,
+        clip_bbox: Optional[List[float]] = None,
     ) -> Optional[Any]:
-        """Copy a remote asset."""
+        """Copy a remote asset.
+
+        Args:
+            clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip the raster to.
+        """
         if src.lower().endswith((".jp2", ".jpx", ".jpeg2000", ".tif", ".tiff")):
-            self.copy_asset_as_cog(src, dest, dtype, nodata)
+            self.copy_asset_as_cog(src, dest, dtype, nodata, clip_bbox)
         else:
             self.copy_asset(src, dest)
         return None
@@ -56,9 +99,18 @@ class GeoanalyticsIOClient:
                 shutil.copyfileobj(reader, writer)
 
     def copy_asset_as_cog(
-        self, src: str, dest: str, dtype: str, nodata: float | None
+        self,
+        src: str,
+        dest: str,
+        dtype: str,
+        nodata: float | None,
+        clip_bbox: Optional[List[float]] = None,
     ) -> None:
-        """Convert a raster file to a Cloud Optimized GeoTIFF (COG)."""
+        """Convert a raster file to a Cloud Optimized GeoTIFF (COG).
+
+        Args:
+            clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip the raster to.
+        """
 
         import rioxarray as rxr
 
@@ -73,7 +125,6 @@ class GeoanalyticsIOClient:
         with fsspec.open(src, "rb", **reader_opts) as reader_file:
             import numpy as np  # noqa: F401
             import rasterio  # noqa: F401
-            import rioxarray  # noqa: F401
             from rio_cogeo.cogeo import cog_translate
             from rio_cogeo.profiles import cog_profiles
 
@@ -100,6 +151,39 @@ class GeoanalyticsIOClient:
                     "OVERVIEW_COUNT": "16",
                     "OVERVIEW_COMPRESS": "DEFLATE",
                 }
+
+                # Clip to AOI bounding box if provided (assumes bbox is in EPSG:4326)
+                if clip_bbox is not None:
+                    from rasterio.warp import transform_bounds
+
+                    minx, miny, maxx, maxy = clip_bbox
+
+                    # Transform clip_bbox from WGS84 to the dataset's CRS
+                    if dataset.rio.crs is not None:
+                        try:
+                            t_minx, t_miny, t_maxx, t_maxy = transform_bounds(
+                                "EPSG:4326", dataset.rio.crs, minx, miny, maxx, maxy
+                            )
+                            print(
+                                f"  Transformed clip bbox to {dataset.rio.crs}: "
+                                f"[{t_minx:.2f}, {t_miny:.2f}, {t_maxx:.2f}, {t_maxy:.2f}]"
+                            )
+                        except Exception as e:
+                            print(f"  Warning: Failed to transform clip bbox: {e}")
+                            t_minx, t_miny, t_maxx, t_maxy = minx, miny, maxx, maxy
+                    else:
+                        t_minx, t_miny, t_maxx, t_maxy = minx, miny, maxx, maxy
+
+                    try:
+                        dataset = dataset.rio.clip_box(
+                            minx=t_minx, miny=t_miny, maxx=t_maxx, maxy=t_maxy
+                        )
+                        print(f"  Clipped dataset bounds: {dataset.rio.bounds()}")
+                    except Exception as e:
+                        print(
+                            f"  Warning: Failed to clip to AOI: {e}, using full extent"
+                        )
+
                 with rasterio.MemoryFile() as tmp_cog_file_src:
                     print("writing raster to memory file")
                     dataset.rio.to_raster(tmp_cog_file_src.name)

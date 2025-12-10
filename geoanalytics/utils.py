@@ -90,6 +90,8 @@ def stack_bands(
     tif_files: List[str],
     dst_crs=None,
     target_resolution: Optional[float] = None,
+    clip_bbox: Optional[List[float]] = None,
+    clip_bbox_crs: str = "EPSG:4326",
 ) -> Tuple[np.ndarray, rasterio.Affine, Any, Dict[str, Any]]:
     """
     Stack multiple single-band TIF files into a single multi-band array.
@@ -106,11 +108,15 @@ def stack_bands(
         dst_crs: Target CRS. If None, uses CRS from the first file.
         target_resolution: Target resolution in CRS units. If None, uses
                           the resolution of the first file.
+        clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
+        clip_bbox_crs: CRS of the clip_bbox (default: EPSG:4326 / WGS84).
 
     Returns:
         Tuple of (stacked array, transform, CRS, metadata dict).
         The stacked array has shape (num_bands, height, width).
     """
+    from rasterio.warp import transform_bounds
+
     if not tif_files:
         raise ValueError("No TIF files provided for stacking")
 
@@ -124,15 +130,55 @@ def stack_bands(
         ref_dtype = ref_src.dtypes[0]
         ref_nodata = ref_src.nodata
 
-        # If target resolution is specified, recalculate dimensions
-        if target_resolution is not None:
+        # If clip_bbox is provided, transform to raster CRS and intersect with raster bounds
+        if clip_bbox is not None:
+            minx, miny, maxx, maxy = clip_bbox
+
+            # Transform clip_bbox from its CRS to the raster's CRS
+            try:
+                transformed_bbox = transform_bounds(
+                    clip_bbox_crs, ref_src.crs, minx, miny, maxx, maxy
+                )
+                t_minx, t_miny, t_maxx, t_maxy = transformed_bbox
+                logger.info(
+                    f"Transformed clip bbox from {clip_bbox_crs} to {ref_src.crs}: "
+                    f"[{t_minx:.2f}, {t_miny:.2f}, {t_maxx:.2f}, {t_maxy:.2f}]"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to transform clip bbox: {e}, using as-is")
+                t_minx, t_miny, t_maxx, t_maxy = minx, miny, maxx, maxy
+
+            # Intersect transformed clip_bbox with raster bounds
+            clipped_minx = max(t_minx, ref_bounds.left)
+            clipped_miny = max(t_miny, ref_bounds.bottom)
+            clipped_maxx = min(t_maxx, ref_bounds.right)
+            clipped_maxy = min(t_maxy, ref_bounds.top)
+
+            if clipped_minx >= clipped_maxx or clipped_miny >= clipped_maxy:
+                logger.warning(
+                    f"Clip bbox [{t_minx:.2f}, {t_miny:.2f}, {t_maxx:.2f}, {t_maxy:.2f}] "
+                    f"does not intersect raster bounds [{ref_bounds.left:.2f}, {ref_bounds.bottom:.2f}, "
+                    f"{ref_bounds.right:.2f}, {ref_bounds.top:.2f}]. Skipping clip."
+                )
+            else:
+                ref_bounds = rasterio.coords.BoundingBox(
+                    clipped_minx, clipped_miny, clipped_maxx, clipped_maxy
+                )
+                logger.info(
+                    f"Clipping to AOI bounds: [{clipped_minx:.2f}, {clipped_miny:.2f}, "
+                    f"{clipped_maxx:.2f}, {clipped_maxy:.2f}]"
+                )
+
+        # If target resolution is specified or clipping, recalculate dimensions
+        if target_resolution is not None or clip_bbox is not None:
+            res = target_resolution if target_resolution else abs(ref_transform[0])
             ref_transform, ref_width, ref_height = calculate_default_transform(
                 ref_src.crs,
                 ref_crs,
                 ref_src.width,
                 ref_src.height,
                 *ref_bounds,
-                resolution=target_resolution,
+                resolution=res,
             )
 
     # Pre-allocate the output array
@@ -345,6 +391,7 @@ def merge_downloaded_assets_to_cog(
     dst_crs=None,
     compression: str = "deflate",
     remove_temp: bool = True,
+    clip_bbox: Optional[List[float]] = None,
     **extra_tags,
 ) -> str:
     """
@@ -363,6 +410,7 @@ def merge_downloaded_assets_to_cog(
         dst_crs: Target CRS. If None, uses CRS from input files.
         compression: COG compression method (default: deflate).
         remove_temp: If True, removes source TIF files after successful merge.
+        clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
         **extra_tags: Additional metadata tags to write.
 
     Returns:
@@ -379,7 +427,7 @@ def merge_downloaded_assets_to_cog(
     try:
         # Stack bands into a single array
         stacked, out_trans, dst_crs_ret, metadata = stack_bands(
-            valid_tifs, dst_crs=dst_crs
+            valid_tifs, dst_crs=dst_crs, clip_bbox=clip_bbox
         )
 
         # Build output metadata
@@ -412,6 +460,9 @@ def merge_downloaded_assets_to_cog(
                 dst.write(stacked)
                 if bandnames:
                     dst.descriptions = tuple(bandnames[: stacked.shape[0]])
+                if clip_bbox is not None:
+                    dst.update_tags(clipped_to_aoi="true")
+                    dst.update_tags(clip_bbox=str(clip_bbox))
 
             # Convert to COG
             cog_profile = cog_profiles.get(compression)
@@ -494,6 +545,8 @@ def stack_bands_to_xarray(
     tif_files: List[str],
     bandnames: Optional[List[str]] = None,
     chunks: Optional[Dict[str, int]] = None,
+    clip_bbox: Optional[List[float]] = None,
+    clip_bbox_crs: str = "EPSG:4326",
 ) -> "xarray.Dataset":
     """
     Stack multiple single-band TIF files into an xarray Dataset.
@@ -506,6 +559,8 @@ def stack_bands_to_xarray(
         bandnames: Optional list of band names. If None, uses filenames.
         chunks: Optional Dask chunk sizes as dict (e.g., {"x": 512, "y": 512}).
                 If provided, returns a Dask-backed Dataset for parallel ops.
+        clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
+        clip_bbox_crs: CRS of the clip_bbox (default: EPSG:4326 / WGS84).
 
     Returns:
         xarray.Dataset with stacked bands and geospatial metadata.
@@ -521,6 +576,7 @@ def stack_bands_to_xarray(
     """
     import rioxarray  # noqa: F401
     import xarray as xr
+    from rasterio.warp import transform_bounds
 
     if not tif_files:
         raise ValueError("No TIF files provided for stacking")
@@ -534,10 +590,37 @@ def stack_bands_to_xarray(
         bandnames = [f"band_{i}" for i in range(len(tif_files))]
 
     data_arrays = []
+    transformed_clip_bbox = None  # Cache the transformed bbox
 
     for i, tif_path in enumerate(tif_files):
         # Open with rioxarray (preserves CRS, transform, etc.)
         da = xr.open_dataarray(tif_path, engine="rasterio", chunks=chunks)
+
+        # Clip to AOI bounding box if provided
+        if clip_bbox is not None:
+            minx, miny, maxx, maxy = clip_bbox
+
+            # Transform clip_bbox to raster CRS if needed (cache for reuse)
+            if transformed_clip_bbox is None and da.rio.crs is not None:
+                try:
+                    transformed_clip_bbox = transform_bounds(
+                        clip_bbox_crs, da.rio.crs, minx, miny, maxx, maxy
+                    )
+                    logger.info(
+                        f"Transformed clip bbox from {clip_bbox_crs} to {da.rio.crs}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to transform clip bbox: {e}, using as-is")
+                    transformed_clip_bbox = (minx, miny, maxx, maxy)
+
+            if transformed_clip_bbox:
+                t_minx, t_miny, t_maxx, t_maxy = transformed_clip_bbox
+                try:
+                    da = da.rio.clip_box(
+                        minx=t_minx, miny=t_miny, maxx=t_maxx, maxy=t_maxy
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to clip band {i}: {e}, using full extent")
 
         # Handle band dimension - we want each file to be a single band
         if "band" in da.dims:
@@ -845,6 +928,7 @@ def write_merged_to_zarr_group(
     io_client,
     bandnames: Optional[List[str]] = None,
     chunks: Tuple[int, int, int] = (1, 512, 512),
+    clip_bbox: Optional[List[float]] = None,
     **extra_attrs,
 ) -> str:
     """
@@ -857,6 +941,7 @@ def write_merged_to_zarr_group(
         io_client: GeoanalyticsIOClient for storage operations.
         bandnames: Optional list of band names.
         chunks: Chunk sizes as (band, y, x) tuple.
+        clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
         **extra_attrs: Additional attributes for the dataset.
 
     Returns:
@@ -864,7 +949,14 @@ def write_merged_to_zarr_group(
     """
     # Stack bands into xarray Dataset
     chunk_dict = {"x": chunks[2], "y": chunks[1]}
-    ds = stack_bands_to_xarray(tif_files, bandnames=bandnames, chunks=chunk_dict)
+    ds = stack_bands_to_xarray(
+        tif_files, bandnames=bandnames, chunks=chunk_dict, clip_bbox=clip_bbox
+    )
+
+    # Add clip_bbox info to attributes if provided
+    if clip_bbox is not None:
+        extra_attrs["clip_bbox"] = str(clip_bbox)
+        extra_attrs["clipped_to_aoi"] = "true"
 
     # Add extra attributes
     for key, value in extra_attrs.items():
@@ -1022,6 +1114,7 @@ def merge_downloaded_assets_to_zarr(
     chunks: Tuple[int, int, int] = (1, 512, 512),
     remove_temp: bool = True,
     parallel: bool = True,
+    clip_bbox: Optional[List[float]] = None,
     **extra_attrs,
 ) -> str:
     """
@@ -1040,6 +1133,7 @@ def merge_downloaded_assets_to_zarr(
         chunks: Chunk sizes as (bands, height, width) tuple.
         remove_temp: If True, removes source TIF files after successful write.
         parallel: If True, uses Dask for parallel loading/writing.
+        clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
         **extra_attrs: Additional attributes to store in the Zarr dataset.
 
     Returns:
@@ -1074,7 +1168,13 @@ def merge_downloaded_assets_to_zarr(
             valid_tifs,
             bandnames=bandnames,
             chunks=chunk_dict,
+            clip_bbox=clip_bbox,
         )
+
+        # Add clip_bbox info to attributes if provided
+        if clip_bbox is not None:
+            extra_attrs["clip_bbox"] = str(clip_bbox)
+            extra_attrs["clipped_to_aoi"] = "true"
 
         # Add descriptions if provided
         if descriptions:
