@@ -229,6 +229,11 @@ class GeoanalyticsIOClient:
             protocol = protocol[0]
         options: dict[str, Any] = {}
         if not protocol:
+            # Local file - create parent directory if writing
+            if write and "/" in path:
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
             return options
         scheme = str(protocol).lower()
         if scheme == "s3":

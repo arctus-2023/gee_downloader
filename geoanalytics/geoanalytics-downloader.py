@@ -430,9 +430,9 @@ class GeoanalyticsDownloader:
                     asset_savedir, anonym, "", store_filename
                 ).rstrip("/")
 
-            # Ensure the store exists
-            print(f"  Opening/creating Zarr store: {store_path}")
-            open_or_create_zarr_store(store_path, self.io_client, mode="a")
+            # Ensure local directory exists
+            if not store_path.startswith(("abfs://", "az://", "s3://", "gs://")):
+                os.makedirs(os.path.dirname(store_path) or ".", exist_ok=True)
 
         try:
             print(f"  Downloading {len(matched_assets)} assets...")
@@ -937,14 +937,20 @@ class GeoanalyticsDownloader:
             future.result()
 
     def _build_target_path(
-        self, asset_dir: str, anonym: str, date_token: str, filename: str
+            self, asset_dir: str, anonym: str, date_token: str, filename: str
     ) -> str:
         normalized_dir = asset_dir.strip("/ ")
-        base = f"abfs://{ADLS_PREFIX}/{normalized_dir}/{anonym}/{date_token}"
 
-        if base.startswith("abfs://"):
+        # Check if save_dir is local or cloud
+        if self.save_dir.startswith(("abfs://", "az://", "s3://", "gs://")):
+            # Cloud storage path
+            base = f"abfs://{ADLS_PREFIX}/{normalized_dir}/{anonym}/{date_token}"
             return f"{base}/{filename}"
-        return os.path.join(base, filename)
+        else:
+            # Local storage path
+            base = os.path.join(self.save_dir, normalized_dir, anonym, date_token)
+            os.makedirs(base, exist_ok=True)
+            return os.path.join(base, filename)
 
 
 def main() -> None:
