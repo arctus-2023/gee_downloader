@@ -186,6 +186,11 @@ class GeoanalyticsIOClient:
 
                 with rasterio.MemoryFile() as tmp_cog_file_src:
                     print("writing raster to memory file")
+                    from raster_io import DimensionNormalizer
+
+                    dataset = DimensionNormalizer().normalize(
+                        dataset, asset_label=str(dest)
+                    )
                     dataset.rio.to_raster(tmp_cog_file_src.name)
                     with rasterio.MemoryFile() as tmp_cog_file_dst:
                         print("writing cog from raster to new memory file")
@@ -212,16 +217,6 @@ class GeoanalyticsIOClient:
                             dest, "wb", auto_mkdir=True, **writer_opts
                         ) as writer:
                             writer.write(tmp_cog_file_dst.read())
-
-                # with rasterio.io.MemoryFile() as tmp_cog_file:
-                #     with tmp_cog_file.open(**cog_profile) as cog_dataset:
-                #         cog_dataset_name = cog_dataset.name
-                #         dataset.rio.to_raster(cog_dataset_name, driver="COG")
-                #     # tmp_cog_file.seek(0)
-                #     with fsspec.open(
-                #         dest, "wb", auto_mkdir=True, **writer_opts
-                #     ) as writer:
-                #         writer.write(tmp_cog_file.read())
 
     def _storage_options(self, path: str, write: bool = False) -> dict[str, Any]:
         protocol, _ = split_protocol(path)

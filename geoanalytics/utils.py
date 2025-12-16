@@ -122,6 +122,8 @@ def stack_bands(
 
     # Use the first file as the reference for grid alignment
     with rasterio.open(tif_files[0], "r") as ref_src:
+        # ref_crs is the *output* CRS we will stack into.
+        # If dst_crs is provided, we will reproject all bands to it.
         ref_crs = dst_crs or ref_src.crs
         ref_transform = ref_src.transform
         ref_width = ref_src.width
@@ -130,35 +132,85 @@ def stack_bands(
         ref_dtype = ref_src.dtypes[0]
         ref_nodata = ref_src.nodata
 
-        # If clip_bbox is provided, transform to raster CRS and intersect with raster bounds
-        if clip_bbox is not None:
-            minx, miny, maxx, maxy = clip_bbox
+        # If we are changing output CRS or resolution (even without clipping),
+        # compute the output grid now.
+        if target_resolution is not None or (dst_crs is not None and dst_crs != ref_src.crs):
+            res = target_resolution if target_resolution else abs(ref_transform[0])
+            ref_transform, ref_width, ref_height = calculate_default_transform(
+                ref_src.crs,
+                ref_crs,
+                ref_src.width,
+                ref_src.height,
+                *ref_bounds,
+                resolution=res,
+            )
 
-            # Transform clip_bbox from its CRS to the raster's CRS
-            try:
-                transformed_bbox = transform_bounds(
-                    clip_bbox_crs, ref_src.crs, minx, miny, maxx, maxy
-                )
-                t_minx, t_miny, t_maxx, t_maxy = transformed_bbox
-                logger.info(
-                    f"Transformed clip bbox from {clip_bbox_crs} to {ref_src.crs}: "
-                    f"[{t_minx:.2f}, {t_miny:.2f}, {t_maxx:.2f}, {t_maxy:.2f}]"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to transform clip bbox: {e}, using as-is")
-                t_minx, t_miny, t_maxx, t_maxy = minx, miny, maxx, maxy
+    # If clip_bbox is provided, transform it to the *output* CRS (ref_crs) and
+    # intersect with the raster bounds.
+    #
+    # Important: if dst_crs != ref_src.crs (e.g., target_crs=auto_utm), we must
+    # NOT transform AOI bbox into ref_src.crs; we must transform into ref_crs,
+    # otherwise clipping is applied in the wrong coordinate space.
+    if clip_bbox is not None:
+        minx, miny, maxx, maxy = clip_bbox
+
+        # Transform clip_bbox from its CRS to the output CRS
+        try:
+            transformed_bbox = transform_bounds(
+                clip_bbox_crs, ref_crs, minx, miny, maxx, maxy
+            )
+            t_minx, t_miny, t_maxx, t_maxy = transformed_bbox
+            logger.info(
+                f"Transformed clip bbox from {clip_bbox_crs} to {ref_crs}: "
+                f"[{t_minx:.2f}, {t_miny:.2f}, {t_maxx:.2f}, {t_maxy:.2f}]"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to transform clip bbox: {e}, using as-is")
+            t_minx, t_miny, t_maxx, t_maxy = minx, miny, maxx, maxy
 
             # Intersect transformed clip_bbox with raster bounds
-            clipped_minx = max(t_minx, ref_bounds.left)
-            clipped_miny = max(t_miny, ref_bounds.bottom)
-            clipped_maxx = min(t_maxx, ref_bounds.right)
-            clipped_maxy = min(t_maxy, ref_bounds.top)
+            # IMPORTANT: ref_bounds are expressed in ref_src.crs. If the output
+            # CRS differs (dst_crs/ref_crs), compare in the output CRS.
+            bounds_left = ref_bounds.left
+            bounds_bottom = ref_bounds.bottom
+            bounds_right = ref_bounds.right
+            bounds_top = ref_bounds.top
+
+            if ref_src.crs is not None and ref_crs is not None and ref_src.crs != ref_crs:
+                try:
+                    b_left, b_bottom, b_right, b_top = transform_bounds(
+                        ref_src.crs,
+                        ref_crs,
+                        bounds_left,
+                        bounds_bottom,
+                        bounds_right,
+                        bounds_top,
+                    )
+                    bounds_left, bounds_bottom, bounds_right, bounds_top = (
+                        b_left,
+                        b_bottom,
+                        b_right,
+                        b_top,
+                    )
+                    logger.info(
+                        f"Transformed raster bounds from {ref_src.crs} to {ref_crs}: "
+                        f"[{bounds_left:.2f}, {bounds_bottom:.2f}, {bounds_right:.2f}, {bounds_top:.2f}]"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to transform raster bounds from {ref_src.crs} to {ref_crs}: {e}"
+                    )
+
+            clipped_minx = max(t_minx, bounds_left)
+            clipped_miny = max(t_miny, bounds_bottom)
+            clipped_maxx = min(t_maxx, bounds_right)
+            clipped_maxy = min(t_maxy, bounds_top)
 
             if clipped_minx >= clipped_maxx or clipped_miny >= clipped_maxy:
                 logger.warning(
                     f"Clip bbox [{t_minx:.2f}, {t_miny:.2f}, {t_maxx:.2f}, {t_maxy:.2f}] "
-                    f"does not intersect raster bounds [{ref_bounds.left:.2f}, {ref_bounds.bottom:.2f}, "
-                    f"{ref_bounds.right:.2f}, {ref_bounds.top:.2f}]. Skipping clip."
+                    f"does not intersect raster bounds [{bounds_left:.2f}, {bounds_bottom:.2f}, "
+                    f"{bounds_right:.2f}, {bounds_top:.2f}] in {ref_crs}. Skipping clip."
                 )
             else:
                 ref_bounds = rasterio.coords.BoundingBox(
@@ -169,17 +221,18 @@ def stack_bands(
                     f"{clipped_maxx:.2f}, {clipped_maxy:.2f}]"
                 )
 
-        # If target resolution is specified or clipping, recalculate dimensions
-        if target_resolution is not None or clip_bbox is not None:
-            res = target_resolution if target_resolution else abs(ref_transform[0])
-            ref_transform, ref_width, ref_height = calculate_default_transform(
-                ref_src.crs,
-                ref_crs,
-                ref_src.width,
-                ref_src.height,
-                *ref_bounds,
-                resolution=res,
-            )
+    # If target resolution is specified or clipping, recalculate grid dimensions
+    # in the output CRS.
+    if clip_bbox is not None:
+        res = target_resolution if target_resolution else abs(ref_transform[0])
+        ref_transform, ref_width, ref_height = calculate_default_transform(
+            ref_src.crs,
+            ref_crs,
+            ref_src.width,
+            ref_src.height,
+            *ref_bounds,
+            resolution=res,
+        )
 
     # Pre-allocate the output array
     num_bands = len(tif_files)
@@ -392,6 +445,7 @@ def merge_downloaded_assets_to_cog(
     compression: str = "deflate",
     remove_temp: bool = True,
     clip_bbox: Optional[List[float]] = None,
+    target_resolution: Optional[float] = None,
     **extra_tags,
 ) -> str:
     """
@@ -411,6 +465,7 @@ def merge_downloaded_assets_to_cog(
         compression: COG compression method (default: deflate).
         remove_temp: If True, removes source TIF files after successful merge.
         clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
+    target_resolution: Optional pixel size (in CRS units) to resample all bands to.
         **extra_tags: Additional metadata tags to write.
 
     Returns:
@@ -427,7 +482,10 @@ def merge_downloaded_assets_to_cog(
     try:
         # Stack bands into a single array
         stacked, out_trans, dst_crs_ret, metadata = stack_bands(
-            valid_tifs, dst_crs=dst_crs, clip_bbox=clip_bbox
+            valid_tifs,
+            dst_crs=dst_crs,
+            target_resolution=target_resolution,
+            clip_bbox=clip_bbox,
         )
 
         # Build output metadata
@@ -457,6 +515,15 @@ def merge_downloaded_assets_to_cog(
                     dst.update_tags(info=descriptions)
                 for key, value in extra_tags.items():
                     dst.update_tags(**{key: value})
+
+                # Minimal QA metadata to aid debugging misalignment issues.
+                try:
+                    dst.update_tags(output_crs=str(dst_crs_ret))
+                    dst.update_tags(output_bounds=str(metadata.get("bounds")))
+                    dst.update_tags(output_transform=str(out_trans))
+                except Exception:
+                    pass
+
                 dst.write(stacked)
                 if bandnames:
                     dst.descriptions = tuple(bandnames[: stacked.shape[0]])
@@ -547,6 +614,8 @@ def stack_bands_to_xarray(
     chunks: Optional[Dict[str, int]] = None,
     clip_bbox: Optional[List[float]] = None,
     clip_bbox_crs: str = "EPSG:4326",
+    dst_crs: Optional[Any] = None,
+    target_resolution: Optional[float] = None,
 ) -> "xarray.Dataset":
     """
     Stack multiple single-band TIF files into an xarray Dataset.
@@ -561,6 +630,9 @@ def stack_bands_to_xarray(
                 If provided, returns a Dask-backed Dataset for parallel ops.
         clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
         clip_bbox_crs: CRS of the clip_bbox (default: EPSG:4326 / WGS84).
+        dst_crs: Optional target CRS. If provided, all bands are reprojected to this CRS.
+        target_resolution: Optional target pixel size (in CRS units). If provided,
+            all bands are resampled to this resolution.
 
     Returns:
         xarray.Dataset with stacked bands and geospatial metadata.
@@ -590,7 +662,8 @@ def stack_bands_to_xarray(
         bandnames = [f"band_{i}" for i in range(len(tif_files))]
 
     data_arrays = []
-    transformed_clip_bbox = None  # Cache the transformed bbox
+    reference_da = None
+    target_crs = dst_crs
 
     for i, tif_path in enumerate(tif_files):
         # Open with rioxarray (preserves CRS, transform, etc.)
@@ -599,22 +672,29 @@ def stack_bands_to_xarray(
         # Clip to AOI bounding box if provided
         if clip_bbox is not None:
             minx, miny, maxx, maxy = clip_bbox
+            transformed_bbox = None
 
-            # Transform clip_bbox to raster CRS if needed (cache for reuse)
-            if transformed_clip_bbox is None and da.rio.crs is not None:
+            if da.rio.crs is not None:
                 try:
-                    transformed_clip_bbox = transform_bounds(
+                    transformed_bbox = transform_bounds(
                         clip_bbox_crs, da.rio.crs, minx, miny, maxx, maxy
                     )
                     logger.info(
                         f"Transformed clip bbox from {clip_bbox_crs} to {da.rio.crs}"
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to transform clip bbox: {e}, using as-is")
-                    transformed_clip_bbox = (minx, miny, maxx, maxy)
+                    logger.warning(
+                        f"Failed to transform clip bbox for {tif_path}: {e}, using as-is"
+                    )
+                    transformed_bbox = (minx, miny, maxx, maxy)
+            else:
+                logger.warning(
+                    f"Band {tif_path} is missing CRS information; clipping skipped"
+                )
+                transformed_bbox = None
 
-            if transformed_clip_bbox:
-                t_minx, t_miny, t_maxx, t_maxy = transformed_clip_bbox
+            if transformed_bbox is not None:
+                t_minx, t_miny, t_maxx, t_maxy = transformed_bbox
                 try:
                     da = da.rio.clip_box(
                         minx=t_minx, miny=t_miny, maxx=t_maxx, maxy=t_maxy
@@ -641,6 +721,32 @@ def stack_bands_to_xarray(
         # Now we should have a 2D array (y, x) - add band dimension with our name
         da = da.expand_dims(dim="band")
         da = da.assign_coords(band=[bandnames[i]])
+
+        if reference_da is None:
+            # Establish reference grid
+            if target_crs is None and getattr(da.rio, "crs", None) is not None:
+                target_crs = da.rio.crs
+
+            if target_crs is not None and (
+                da.rio.crs is None or str(da.rio.crs) != str(target_crs)
+            ):
+                da = da.rio.reproject(target_crs, resolution=target_resolution)
+            elif target_resolution is not None:
+                current_crs = da.rio.crs
+                if current_crs is None:
+                    raise ValueError(
+                        "Target resolution requested but band lacks CRS metadata"
+                    )
+                da = da.rio.reproject(current_crs, resolution=target_resolution)
+
+            reference_da = da
+        else:
+            if reference_da.rio.crs is not None and da.rio.crs is not None:
+                da = da.rio.reproject_match(reference_da)
+            elif da.shape != reference_da.shape:
+                raise ValueError(
+                    "Unable to align bands without CRS information; ensure downloads preserve georeferencing"
+                )
 
         data_arrays.append(da)
 
@@ -929,6 +1035,8 @@ def write_merged_to_zarr_group(
     bandnames: Optional[List[str]] = None,
     chunks: Tuple[int, int, int] = (1, 512, 512),
     clip_bbox: Optional[List[float]] = None,
+    dst_crs=None,
+    target_resolution: Optional[float] = None,
     **extra_attrs,
 ) -> str:
     """
@@ -940,8 +1048,10 @@ def write_merged_to_zarr_group(
         group_path: Path within the store (e.g., "20250103/merged").
         io_client: GeoanalyticsIOClient for storage operations.
         bandnames: Optional list of band names.
-        chunks: Chunk sizes as (band, y, x) tuple.
-        clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
+    chunks: Chunk sizes as (band, y, x) tuple.
+    clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
+    dst_crs: Optional CRS for the merged dataset.
+    target_resolution: Optional pixel size (in CRS units) to resample all bands to.
         **extra_attrs: Additional attributes for the dataset.
 
     Returns:
@@ -950,7 +1060,12 @@ def write_merged_to_zarr_group(
     # Stack bands into xarray Dataset
     chunk_dict = {"x": chunks[2], "y": chunks[1]}
     ds = stack_bands_to_xarray(
-        tif_files, bandnames=bandnames, chunks=chunk_dict, clip_bbox=clip_bbox
+        tif_files,
+        bandnames=bandnames,
+        chunks=chunk_dict,
+        clip_bbox=clip_bbox,
+        dst_crs=dst_crs,
+        target_resolution=target_resolution,
     )
 
     # Add clip_bbox info to attributes if provided
@@ -1011,6 +1126,8 @@ def ingest_scene_to_zarr_store(
     chunks: Tuple[int, int, int] = (1, 512, 512),
     write_individual_bands: bool = True,
     write_merged: bool = True,
+    dst_crs=None,
+    target_resolution: Optional[float] = None,
     **scene_attrs,
 ) -> Dict[str, str]:
     """
@@ -1029,6 +1146,8 @@ def ingest_scene_to_zarr_store(
         chunks: Chunk sizes as (band, y, x) tuple.
         write_individual_bands: If True, write each band as a separate array.
         write_merged: If True, write the stacked multi-band array.
+    dst_crs: Optional CRS for the stacked data.
+    target_resolution: Optional pixel size (in CRS units) for resampling.
         **scene_attrs: Additional attributes for the scene group (e.g., cloud_cover).
 
     Returns:
@@ -1093,6 +1212,8 @@ def ingest_scene_to_zarr_store(
                 io_client=io_client,
                 bandnames=bandnames,
                 chunks=chunks,
+                dst_crs=dst_crs,
+                target_resolution=target_resolution,
                 **scene_attrs,
             )
             result_paths["merged"] = path
@@ -1115,6 +1236,7 @@ def merge_downloaded_assets_to_zarr(
     remove_temp: bool = True,
     parallel: bool = True,
     clip_bbox: Optional[List[float]] = None,
+    target_resolution: Optional[float] = None,
     **extra_attrs,
 ) -> str:
     """
@@ -1133,7 +1255,8 @@ def merge_downloaded_assets_to_zarr(
         chunks: Chunk sizes as (bands, height, width) tuple.
         remove_temp: If True, removes source TIF files after successful write.
         parallel: If True, uses Dask for parallel loading/writing.
-        clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
+    clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
+    target_resolution: Optional pixel size (in CRS units) to resample all bands to.
         **extra_attrs: Additional attributes to store in the Zarr dataset.
 
     Returns:
@@ -1169,6 +1292,8 @@ def merge_downloaded_assets_to_zarr(
             bandnames=bandnames,
             chunks=chunk_dict,
             clip_bbox=clip_bbox,
+            dst_crs=dst_crs,
+            target_resolution=target_resolution,
         )
 
         # Add clip_bbox info to attributes if provided
