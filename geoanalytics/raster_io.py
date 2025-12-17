@@ -18,8 +18,6 @@ from typing import Any, Dict, Optional
 
 import rasterio
 
-import numpy as np
-
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +35,7 @@ class DownloadToLocalRequest:
     align_to_reference: bool = False
     clip_bbox: Optional[list[float]] = None
     clip_bbox_crs: str = "EPSG:4326"
+    target_resolution: Optional[float] = None
 
 
 class RasterDownloader:
@@ -71,13 +70,12 @@ class RasterDownloader:
                     # (Passing xarray objects around can trigger numpy truthiness errors
                     # if any downstream code does `if reference_data:`.)
                     # if request.spatial_metadata is not None:
-                    dataset = SarAligner().maybe_align(
-                        dataset,
-                        spatial_metadata=request.spatial_metadata,
-                        reference_data=request.reference_data,
-                        orbit_state=request.orbit_state,
-                        align_to_reference=request.align_to_reference,
-                    )
+                    if request.orbit_state is not None:
+                        # AWS STAC bbox is always EPSG:4326 for S1
+                        # Reproject dataset to EPSG:4326 for intersection
+                        dataset = dataset.rio.reproject(
+                            request.fallback_crs or "EPSG:4326"
+                        )
                 except Exception as exc:
                     logger.error("%s: failed SAR alignment step: %s", label, exc)
                     raise
@@ -87,50 +85,61 @@ class RasterDownloader:
                 # applied in the final georegistered grid.
                 if request.clip_bbox is not None:
                     try:
+                        logger.debug(
+                            "%s: clip requested. dataset dims=%s shape=%s crs=%s transform=%s bounds=%s",
+                            label,
+                            getattr(dataset, "dims", None),
+                            getattr(dataset, "shape", None),
+                            getattr(getattr(dataset, "rio", None), "crs", None),
+                            getattr(
+                                getattr(dataset, "rio", None), "transform", lambda: None
+                            )(),
+                            getattr(
+                                getattr(dataset, "rio", None), "bounds", lambda: None
+                            )(),
+                        )
                         if dataset.rio.crs is None:
                             logger.warning(
                                 "%s: clip requested but dataset CRS is missing; skipping clip",
                                 label,
                             )
                         else:
-                            from rasterio.warp import transform_bounds
-
                             minx, miny, maxx, maxy = request.clip_bbox
-                            t_minx, t_miny, t_maxx, t_maxy = transform_bounds(
-                                request.clip_bbox_crs,
-                                dataset.rio.crs,
-                                minx,
-                                miny,
-                                maxx,
-                                maxy,
+                            # Reproject bbox to dataset CRS if needed
+                            if request.clip_bbox_crs != str(dataset.rio.crs):
+                                from rasterio.warp import transform_bounds
+
+                                minx, miny, maxx, maxy = transform_bounds(
+                                    request.clip_bbox_crs,
+                                    str(dataset.rio.crs),
+                                    minx,
+                                    miny,
+                                    maxx,
+                                    maxy,
+                                    densify_pts=21,
+                                )
+                            dataset = dataset.rio.clip_box(
+                                minx=minx, miny=miny, maxx=maxx, maxy=maxy
                             )
-
-                            # Intersect with raster bounds to avoid errors.
-                            b_left, b_bottom, b_right, b_top = dataset.rio.bounds()
-                            i_minx = max(t_minx, b_left)
-                            i_miny = max(t_miny, b_bottom)
-                            i_maxx = min(t_maxx, b_right)
-                            i_maxy = min(t_maxy, b_top)
-
-                            if i_minx >= i_maxx or i_miny >= i_maxy:
-                                logger.warning(
-                                    "%s: AOI bbox does not intersect raster bounds; skipping clip",
-                                    label,
-                                )
-                            else:
-                                dataset = dataset.rio.clip_box(
-                                    minx=i_minx,
-                                    miny=i_miny,
-                                    maxx=i_maxx,
-                                    maxy=i_maxy,
-                                )
-                                try:
-                                    dataset.attrs["clipped_to_aoi"] = "true"
-                                    dataset.attrs["clip_bbox"] = str(request.clip_bbox)
-                                except Exception:
-                                    pass
+                            logger.debug(
+                                "%s: clip applied. new dataset dims=%s shape=%s crs=%s transform=%s bounds=%s",
+                                label,
+                                getattr(dataset, "dims", None),
+                                getattr(dataset, "shape", None),
+                                getattr(getattr(dataset, "rio", None), "crs", None),
+                                getattr(
+                                    getattr(dataset, "rio", None),
+                                    "transform",
+                                    lambda: None,
+                                )(),
+                                getattr(
+                                    getattr(dataset, "rio", None),
+                                    "bounds",
+                                    lambda: None,
+                                )(),
+                            )
                     except Exception as exc:
-                        logger.error("%s: failed clipping to AOI bbox: %s", label, exc)
+                        logger.error("%s: failed clipping to bbox: %s", label, exc)
                         raise
 
                 try:
@@ -138,7 +147,9 @@ class RasterDownloader:
                         dataset = dataset.rio.set_nodata(request.nodata)
                         dataset = dataset.rio.write_nodata(request.nodata, encoded=True)
                 except Exception as exc:
-                    logger.error("%s: failed setting nodata (%s): %s", label, request.nodata, exc)
+                    logger.error(
+                        "%s: failed setting nodata (%s): %s", label, request.nodata, exc
+                    )
                     raise
 
                 try:
@@ -149,7 +160,9 @@ class RasterDownloader:
                     raise
 
                 try:
-                    dataset = DimensionNormalizer().normalize(dataset, asset_label=label)
+                    dataset = DimensionNormalizer().normalize(
+                        dataset, asset_label=label
+                    )
                 except Exception as exc:
                     logger.error("%s: failed dimension normalization: %s", label, exc)
                     raise
@@ -241,9 +254,7 @@ class DimensionNormalizer:
         desired = [d for d in dims if d not in (effective_band, "y", "x")]
         desired += [effective_band, "y", "x"]
         if tuple(dims) != tuple(desired):
-            logger.debug(
-                "%s: normalizing dims %s -> %s", asset_label, dims, desired
-            )
+            logger.debug("%s: normalizing dims %s -> %s", asset_label, dims, desired)
             dataset = dataset.transpose(*desired)
 
         return dataset
@@ -251,65 +262,6 @@ class DimensionNormalizer:
 
 class SpatialMetadataApplier:
     """Applies STAC projection metadata to rioxarray datasets."""
-
-    @staticmethod
-    def _normalize_grid_orientation(
-        dataset,
-        spatial_metadata: Dict[str, Any],
-        *,
-        asset_label: str,
-    ):
-        """Fix swapped x/y orientation using STAC proj:shape/transform.
-
-        Why this exists:
-        - Some Sentinel-1 assets appear rotated 90° in GIS tools when written
-          using a transform computed/applied with swapped axis assumptions.
-        - xarray/rioxarray uses dims as (..., y, x). We should never assume
-          x/y ordering from `dataset.values` alone.
-
-        Strategy:
-        - If STAC proj:shape is present and indicates that raster (height,width)
-          are swapped, transpose the spatial axes.
-        - This is sufficient to resolve the common 90° rotation symptom.
-
-        Returns:
-            Possibly transposed dataset.
-        """
-
-        stac_shape = spatial_metadata.get("proj:shape")
-        if not (isinstance(stac_shape, (list, tuple)) and len(stac_shape) == 2):
-            return dataset
-
-        try:
-            stac_height, stac_width = int(stac_shape[0]), int(stac_shape[1])
-        except Exception:
-            return dataset
-
-        height = int(dataset.rio.height)
-        width = int(dataset.rio.width)
-
-        if height == stac_height and width == stac_width:
-            return dataset
-
-        # If swapped, enforce orientation by transposing spatial axes.
-        if height == stac_width and width == stac_height:
-            logger.info(
-                "%s: Detected swapped raster dims (file h=%s,w=%s vs STAC h=%s,w=%s). Transposing y/x.",
-                asset_label,
-                height,
-                width,
-                stac_height,
-                stac_width,
-            )
-            # rioxarray DataArray is typically (band, y, x) or (y, x)
-            # Forced transpose of spatial dims only to ensure correct orientation.
-            dims = list(getattr(dataset, "dims", ()))
-            if "y" in dims and "x" in dims:
-                return dataset.transpose(
-                    *[d for d in dims if d not in ("y", "x")], "y", "x"
-                )
-
-        return dataset
 
     @staticmethod
     def _is_identity_or_invalid_transform(transform) -> bool:
@@ -384,11 +336,6 @@ class SpatialMetadataApplier:
         actual_height = dataset.rio.height
 
         if spatial_metadata:
-            # Fix possible swapped x/y orientation first (helps avoid a 90° rotation)
-            dataset = self._normalize_grid_orientation(
-                dataset, spatial_metadata, asset_label=asset_label
-            )
-
             crs_value = self._crs_from_metadata(spatial_metadata)
             if dataset.rio.crs is None and crs_value:
                 dataset = dataset.rio.write_crs(crs_value, inplace=True)
@@ -419,139 +366,3 @@ class SpatialMetadataApplier:
             )
 
         return dataset
-
-
-class SarAligner:
-    """Handles optional SAR-to-reference alignment.
-
-    This keeps the downloader readable; the heavy maths can evolve here.
-
-    For now we keep it as a no-op wrapper (it can be expanded incrementally).
-    """
-
-    def maybe_align(
-        self,
-        dataset,
-        *,
-        spatial_metadata: Dict[str, Any],
-        reference_data,
-        orbit_state: Optional[str],
-        align_to_reference: bool = False,
-    ):
-        """Optionally apply SAR alignment/orientation fixes.
-
-        Important: `reference_data` may be an xarray object. Never use it (or any
-        xarray/numpy array) in a boolean context.
-        """
-
-        # If reference_data is our special marker, apply orbit-based orientation
-        # correction only (no reproject_match).
-        if isinstance(reference_data, str) and reference_data == "__ORBIT_ORIENT__":
-            return self._apply_orbit_orientation(dataset, orbit_state=orbit_state)
-
-        # If an xarray reference dataset was provided (e.g., Sentinel-2), we can
-        # optionally snap/reproject the SAR grid to match it.
-        if align_to_reference and reference_data is not None:
-            try:
-                # Avoid boolean evaluation of xarray objects.
-                ref_crs = getattr(getattr(reference_data, "rio", None), "crs", None)
-                if ref_crs is None:
-                    logger.warning("SAR align_to_reference requested but reference CRS missing; skipping")
-                    return dataset
-
-                # Ensure SAR dataset has a CRS/transform before matching.
-                if dataset.rio.crs is None:
-                    logger.warning("SAR align_to_reference requested but SAR CRS missing; skipping")
-                    return dataset
-
-                # rioxarray will resample; bilinear is typically ok for amplitude-like
-                # continuous rasters, but keep nearest as safer default.
-                dataset = dataset.rio.reproject_match(reference_data, resampling=rasterio.enums.Resampling.nearest)
-                try:
-                    dataset.attrs["sar_aligned_to_reference"] = "true"
-                except Exception:
-                    pass
-                return dataset
-            except Exception as exc:
-                logger.warning("SAR reproject_match failed; leaving as-is: %s", exc)
-                return dataset
-
-        _ = (spatial_metadata, orbit_state)
-        return dataset
-
-    @staticmethod
-    def _apply_orbit_orientation(dataset, *, orbit_state: Optional[str]):
-        """Apply a deterministic rotation for Sentinel-1 GRD."""
-        if orbit_state is None:
-            return dataset
-
-        state = str(orbit_state).strip().lower()
-        if state not in {"ascending", "descending"}:
-            return dataset
-
-        # 1. Rotate Data (same as before)
-        dataset = DimensionNormalizer().normalize(dataset, asset_label="sar")
-        data = dataset.values
-        k = 1 if state == "descending" else -1
-
-        # Handle 2D vs 3D rotation
-        if data.ndim == 2:
-            rotated_data = np.rot90(data, k=k, axes=(0, 1))
-        else:
-            rotated_data = np.rot90(data, k=k, axes=(1, 2))
-
-        # 2. Calculate New Affine Transform (CENTER PRESERVING)
-        t = dataset.rio.transform()
-        width = dataset.rio.width
-        height = dataset.rio.height
-
-        # Calculate the geographic center of the original footprint
-        # Note: (width/2, height/2) are pixel coordinates of the center
-        center_x, center_y = t * (width / 2, height / 2)
-
-        # New resolutions (swap x/y magnitudes)
-        # Assuming North-Up input: t.a > 0, t.e < 0
-        new_x_res = abs(t.e)
-        new_y_res = -abs(t.a)
-
-        # New dimensions (swapped)
-        new_width = height
-        new_height = width
-
-        # Calculate New Top-Left (c, f) such that the center point is preserved
-        # center_x = new_c + (new_width / 2) * new_x_res
-        # center_y = new_f + (new_height / 2) * new_y_res
-        new_c = center_x - (new_width / 2) * new_x_res
-        new_f = center_y - (new_height / 2) * new_y_res
-
-        new_t = rasterio.transform.Affine(
-            new_x_res, 0.0, new_c,
-            0.0, new_y_res, new_f
-        )
-
-        # 3. Reconstruct DataArray
-        # We assume dimensions are simply swapped in name/order context
-        # If input was (band, y, x), output is still (band, y, x) but y/x sizes swapped
-        try:
-            import xarray as xr
-            rotated_da = xr.DataArray(
-                rotated_data,
-                dims=dataset.dims,
-                attrs=dataset.attrs,
-                name=dataset.name,
-            )
-
-            rotated_da = rotated_da.rio.write_crs(dataset.rio.crs, inplace=True)
-            rotated_da = rotated_da.rio.write_transform(new_t, inplace=True)
-
-            # Explicitly clear old coords so rioxarray regenerates them from transform
-            if "x" in rotated_da.coords: del rotated_da.coords["x"]
-            if "y" in rotated_da.coords: del rotated_da.coords["y"]
-
-            if dataset.rio.nodata is not None:
-                rotated_da = rotated_da.rio.write_nodata(dataset.rio.nodata, inplace=True)
-
-            return rotated_da
-
-        except Exception:
-            return dataset

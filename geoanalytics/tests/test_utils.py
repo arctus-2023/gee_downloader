@@ -49,7 +49,12 @@ def test_stack_bands_resamples_to_target_resolution(tmp_path):
     assert metadata["bounds"] is not None
 
 
-def test_stack_bands_to_xarray_respects_resolution(tmp_path):
+def test_stack_bands_resamples_to_finer_resolution(tmp_path):
+    """Regression test: Zarr/xarray output support was removed.
+
+    We still expect `stack_bands` to support target_resolution resampling.
+    """
+
     transform = from_origin(0, 40, 20, 20)
     band1 = tmp_path / "band1.tif"
     band2 = tmp_path / "band2.tif"
@@ -57,16 +62,13 @@ def test_stack_bands_to_xarray_respects_resolution(tmp_path):
     _write_test_tif(band1, np.ones((2, 2), dtype=np.uint16), transform)
     _write_test_tif(band2, np.ones((2, 2), dtype=np.uint16) * 3, transform)
 
-    ds = utils.stack_bands_to_xarray(
-        [str(band1), str(band2)],
-        bandnames=["one", "two"],
-        target_resolution=5,
+    stacked, out_transform, dst_crs, metadata = utils.stack_bands(
+        [str(band1), str(band2)], target_resolution=5
     )
 
-    assert list(ds.attrs.get("bandnames", [])) == ["one", "two"]
-    assert ds["data"].shape[0] == 2
+    assert stacked.shape[0] == 2
     # 20m pixels -> 4x upsample for 5m target => 8x8 grid
-    assert ds["data"].shape[1:] == (8, 8)
-    resx, resy = ds["data"].rio.resolution()
-    assert pytest.approx(resx) == 5
-    assert pytest.approx(abs(resy)) == 5
+    assert stacked.shape[1:] == (8, 8)
+    assert pytest.approx(out_transform.a) == 5
+    assert dst_crs is not None
+    assert metadata["bounds"] is not None

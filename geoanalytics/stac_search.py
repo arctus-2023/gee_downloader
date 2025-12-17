@@ -24,6 +24,29 @@ from pystac_client.exceptions import APIError
 logger = logging.getLogger(__name__)
 
 
+def _item_datetime_utc(item) -> Optional[str]:
+    """Return an ISO8601 datetime string for a STAC item if available.
+
+    Prefers `properties.datetime`, then `properties.start_datetime`.
+    """
+    props = getattr(item, "properties", None)
+    if not props:
+        return None
+    return props.get("datetime") or props.get("start_datetime")
+
+
+def _iso_to_utc_date_str(dt: str) -> Optional[str]:
+    """Parse an ISO timestamp and return YYYY-MM-DD (UTC)."""
+    if not dt:
+        return None
+    try:
+        import pendulum
+
+        return pendulum.parse(dt).in_timezone("UTC").format("YYYY-MM-DD")
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class StacSearchConfig:
     endpoints: Sequence[str]
@@ -88,6 +111,87 @@ class StacSearcher:
             return self._find_item_sar(collection, bbox, period, endpoints, evaluator)
 
         return self._find_item_optical(collection, bbox, period, endpoints)
+
+    def find_items(
+        self,
+        *,
+        collection: str,
+        bbox: List[float],
+        period: str,
+        endpoints: Optional[Sequence[str]] = None,
+        limit: int = 50,
+        coverage_evaluator: Optional["CoverageEvaluator"] = None,
+        day_tolerance: int = 0,
+    ) -> List[Any]:
+        """Find *all* STAC items matching a collection/period/bbox.
+
+        This is used for workflows that need to mosaic multiple overlapping tiles
+        for the same day (e.g. Sentinel-2 partial tiles).
+
+        Notes:
+        - For optical collections, items are ordered by increasing cloud cover
+          when supported by the endpoint.
+        - For SAR collections, items are returned without ranking unless a
+          `coverage_evaluator` is provided.
+        """
+
+        # NOTE:
+        # - Optical workflows often want "same-day" semantics so we don't mosaic
+        #   across adjacent acquisitions.
+        # - SAR workflows historically used a wider interpretation of "day".
+        #   Revisit times are coarse and providers can surface items whose UTC
+        #   timestamp lands just outside the requested day window.
+        #   For SAR we therefore keep the historical behavior: no strict day filter.
+        requested_day = None
+        try:
+            requested_day = str(period).split("/")[0]
+        except Exception:
+            requested_day = None
+
+        if self.is_sar_collection(collection):
+            evaluator = coverage_evaluator or CoverageEvaluator()
+            items = self._find_items_sar(
+                collection, bbox, period, endpoints, evaluator, limit
+            )
+        else:
+            items = self._find_items_optical(collection, bbox, period, endpoints, limit)
+
+        # Preserve old SAR behavior: don't apply strict day filtering.
+        if self.is_sar_collection(collection):
+            return items
+
+        if not items or not requested_day:
+            return items
+
+        tolerance = max(int(day_tolerance or 0), 0)
+
+        filtered: List[Any] = []
+        for item in items:
+            dt = _item_datetime_utc(item)
+            day = _iso_to_utc_date_str(dt) if dt else None
+            if day is None:
+                # If we can't parse, keep it rather than accidentally dropping data.
+                filtered.append(item)
+                continue
+
+            if tolerance == 0:
+                if day == requested_day:
+                    filtered.append(item)
+                continue
+
+            try:
+                import pendulum
+
+                delta_days = abs(
+                    pendulum.parse(day).date().diff(pendulum.parse(requested_day).date()).in_days()
+                )
+                if delta_days <= tolerance:
+                    filtered.append(item)
+            except Exception:
+                # If date math fails, keep it rather than dropping data.
+                filtered.append(item)
+
+        return filtered
 
     def _find_item_optical(
         self,
@@ -159,6 +263,82 @@ class StacSearcher:
 
         return None
 
+    def _find_items_optical(
+        self,
+        collection: str,
+        bbox: List[float],
+        period: str,
+        endpoints: Optional[Sequence[str]],
+        limit: int,
+    ) -> List[Any]:
+        query = [f"eo:cloud_cover <= {self.config.cloud_threshold}"]
+
+        for endpoint in self.iter_endpoints(endpoints):
+            client = self.open_client(endpoint)
+            if client is None:
+                continue
+
+            # Try with sort/query first.
+            try:
+                search = client.search(
+                    collections=[collection],
+                    bbox=bbox,
+                    datetime=period,
+                    query=query,
+                    limit=limit,
+                    sortby=[{"field": "eo:cloud_cover", "direction": "asc"}],
+                )
+                items = list(search.items())
+                if items:
+                    return items
+            except APIError as exc:
+                logger.info(
+                    "STAC endpoint %s rejected sort/query for multi-item search: %s. Retrying without sort...",
+                    endpoint,
+                    exc,
+                )
+            except Exception as exc:
+                logger.warning("STAC multi-item search failed at %s: %s", endpoint, exc)
+
+            # fallback 1: no sort
+            try:
+                search = client.search(
+                    collections=[collection],
+                    bbox=bbox,
+                    datetime=period,
+                    query=query,
+                    limit=limit,
+                )
+                items = list(search.items())
+                if items:
+                    return items
+            except Exception as exc:
+                logger.warning(
+                    "STAC fallback (no-sort) multi-item search failed at %s: %s",
+                    endpoint,
+                    exc,
+                )
+
+            # fallback 2: no query
+            try:
+                search = client.search(
+                    collections=[collection],
+                    bbox=bbox,
+                    datetime=period,
+                    limit=limit,
+                )
+                items = list(search.items())
+                if items:
+                    return items
+            except Exception as exc:
+                logger.warning(
+                    "STAC fallback (no-query) multi-item search failed at %s: %s",
+                    endpoint,
+                    exc,
+                )
+
+        return []
+
     def _find_item_sar(
         self,
         collection: str,
@@ -209,6 +389,39 @@ class StacSearcher:
                 logger.warning("SAR STAC search failed at %s: %s", endpoint, exc)
 
         return None
+
+    def _find_items_sar(
+        self,
+        collection: str,
+        bbox: List[float],
+        period: str,
+        endpoints: Optional[Sequence[str]],
+        evaluator: "CoverageEvaluator",
+        limit: int,
+    ) -> List[Any]:
+        for endpoint in self.iter_endpoints(endpoints):
+            client = self.open_client(endpoint)
+            if client is None:
+                continue
+
+            try:
+                search = client.search(
+                    collections=[collection],
+                    bbox=bbox,
+                    datetime=period,
+                    limit=limit,
+                )
+                items = list(search.items())
+                if not items:
+                    continue
+
+                # Heuristic ordering: higher AOI coverage first.
+                items.sort(key=lambda it: evaluator.compute_coverage(it, bbox), reverse=True)
+                return items
+            except Exception as exc:
+                logger.warning("SAR multi-item STAC search failed at %s: %s", endpoint, exc)
+
+        return []
 
 
 class CoverageEvaluator:

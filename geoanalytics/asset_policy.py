@@ -70,11 +70,12 @@ class AssetDownloadPolicy:
         if key_lower.endswith(self.skip_suffixes):
             return False
 
-        # RGB "visual" assets are not supported for download/merge.
-        # Historically: skip when section implies RGB product; allow pipeline to
-        # handle optical+band assets.
+        # The STAC `visual` asset is *exactly* what we want for RGB products.
+        # (Older versions of this workflow skipped visual because it can be JPG/PNG
+        # in some collections, but for Sentinel-2 L2A on Earth Search it is commonly
+        # a COG we can clip/stream.)
         if "RGB" in section.upper() and "visual" in key_lower:
-            return False
+            return True
 
         return True
 

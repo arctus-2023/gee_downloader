@@ -78,6 +78,7 @@ class GeoanalyticsIOClient:
         dtype: str,
         nodata: float | None,
         clip_bbox: Optional[List[float]] = None,
+        target_resolution: Optional[float] = None,
     ) -> Optional[Any]:
         """Copy a remote asset.
 
@@ -85,7 +86,9 @@ class GeoanalyticsIOClient:
             clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip the raster to.
         """
         if src.lower().endswith((".jp2", ".jpx", ".jpeg2000", ".tif", ".tiff")):
-            self.copy_asset_as_cog(src, dest, dtype, nodata, clip_bbox)
+            self.copy_asset_as_cog(
+                src, dest, dtype, nodata, clip_bbox, target_resolution
+            )
         else:
             self.copy_asset(src, dest)
         return None
@@ -105,6 +108,7 @@ class GeoanalyticsIOClient:
         dtype: str,
         nodata: float | None,
         clip_bbox: Optional[List[float]] = None,
+        target_resolution: Optional[float] = None,
     ) -> None:
         """Convert a raster file to a Cloud Optimized GeoTIFF (COG).
 
@@ -133,6 +137,25 @@ class GeoanalyticsIOClient:
                 if nodata is not None:
                     dataset = dataset.rio.set_nodata(nodata)
                     dataset = dataset.rio.write_nodata(nodata, encoded=True)
+
+                # Resample to target resolution if provided
+                if target_resolution is not None:
+                    from rasterio.enums import Resampling
+
+                    scale_factor_x = target_resolution / abs(
+                        dataset.rio.resolution()[0]
+                    )
+                    scale_factor_y = target_resolution / abs(
+                        dataset.rio.resolution()[1]
+                    )
+                    new_width = int(dataset.rio.width * scale_factor_x)
+                    new_height = int(dataset.rio.height * scale_factor_y)
+                    dataset = dataset.rio.reproject(
+                        dataset.rio.crs,
+                        shape=(new_height, new_width),
+                        resampling=Resampling.bilinear,
+                    )
+
                 # rioxarray and XArray typically misinterprets dtypes and force float64
                 if dtype:
                     dataset = dataset.astype(dtype)

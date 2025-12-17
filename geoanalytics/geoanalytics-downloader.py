@@ -6,39 +6,35 @@ from __future__ import annotations
 import argparse
 import configparser
 import json
-import os
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import adlfs  # registers the `abfs` protocol for fsspec  # noqa: F401
 import pendulum
-from geoanalytics_io_client import GeoanalyticsIOClient, IOConfig
-from pystac_client import Client
-from utils import (
-    open_or_create_zarr_store,
-    write_band_to_zarr_group,
-)
-
 from asset_policy import (
     AssetDownloadPolicy,
     build_asset_alias_map,
+)
+from asset_policy import (
     normalize_band_name as _normalize_band_name_impl,
+)
+from asset_policy import (
     safe_split as _safe_split_impl,
 )
-
-from stac_search import StacSearchConfig, StacSearcher
-
+from geoanalytics_io_client import GeoanalyticsIOClient, IOConfig
 from merge_strategies import (
     MergeContext,
     build_merge_strategy,
-    HierarchicalZarrSpec,
 )
-
-from raster_io import DownloadToLocalRequest, RasterDownloader
+from pystac_client import Client
 from qa_quicklook import QuicklookRequest, render_quicklook, write_raster_metadata_json
+from raster_io import DownloadToLocalRequest, RasterDownloader
+from stac_search import StacSearchConfig, StacSearcher
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 STAC_ENDPOINTS = [
     "https://earth-search.aws.element84.com/v1",
@@ -298,51 +294,23 @@ class GeoanalyticsDownloader:
                 return
         print(msg)
 
-        # Output format: "cog" (default) or "zarr"
-        self.output_format = self.global_config.get("output_format", "cog").lower()
-        if self.output_format not in ("cog", "zarr"):
-            raise ValueError(
-                f"output_format must be 'cog' or 'zarr', got '{self.output_format}'"
-            )
+        # Output format: only COG output is currently supported.
+        # We keep the attribute for backwards-compatible code paths, but force it.
+        self.output_format = "cog"
 
-        # Zarr-specific settings
-        self.zarr_chunks = self._parse_chunks(
-            self.global_config.get("zarr_chunks", "1,512,512")
-        )
-
-        # Hierarchical Zarr mode: single store with groups per scene
-        # If True, creates structure: <collection>.zarr/<date>/bands/ and <date>/merged/
-        self.hierarchical_zarr = (
-            self.global_config.get("hierarchical_zarr", "false").lower() == "true"
-        )
-
-        # Whether to write individual bands to Zarr (only used in hierarchical mode)
-        self.write_individual_bands = (
-            self.global_config.get("write_individual_bands", "true").lower() == "true"
-        )
-
-        # Path to the root Zarr store (only used in hierarchical mode)
-        # If not set, will be derived from save_dir and collection name
-        self.zarr_store_path = self.global_config.get("zarr_store_path", "")
+        # Legacy Zarr settings are intentionally removed/ignored.
+        self.zarr_chunks = (1, 512, 512)
+        self.hierarchical_zarr = False
+        self.write_individual_bands = False
+        self.zarr_store_path = ""
 
     def _parse_chunks(self, chunks_str: str) -> tuple[int, int, int]:
-        """Parse chunk size string like '1,512,512' into a tuple."""
-        try:
-            parts = [int(x.strip()) for x in chunks_str.split(",")]
-            if len(parts) == 3:
-                return tuple(parts)
-            elif len(parts) == 2:
-                return (1, parts[0], parts[1])
-            elif len(parts) == 1:
-                return (1, parts[0], parts[0])
-            else:
-                raise ValueError("Too many values")
-        except Exception:
-            logger.warning(
-                "Could not parse zarr_chunks '%s', using default (1, 512, 512)",
-                chunks_str,
-            )
-            return (1, 512, 512)
+        """Legacy helper (Zarr support was removed).
+
+        Kept to avoid breaking external code that may import it.
+        """
+        _ = chunks_str
+        return (1, 512, 512)
 
     def run(self) -> None:
         logger.info("Starting Geoanalytics download workflow")
@@ -391,28 +359,39 @@ class GeoanalyticsDownloader:
                         )
                         continue
 
-                    item = self._find_stac_item(collection, current_date, section_endpoints)
-                    if item is None:
-                        self._emit(
-                            f"  No STAC item found for {collection} on {date_str}"
-                        )
-                        continue
-
-                    processed_items += 1
-
-                    matched_assets = self._match_assets(section, item, include_bands)
-                    if not matched_assets:
-                        self._emit(
-                            f"  No matching assets found for {section} on {date_str}"
-                        )
-                        continue
-
                     if should_merge:
-                        # Download to temp directory and merge
-                        self._download_and_merge_assets(
+                        # For merge workflows we want to consider multiple items
+                        # for a single day (e.g., overlapping partial tiles).
+                        items = self._find_stac_items(
+                            collection, current_date, section_endpoints
+                        )
+                        if not items:
+                            self._emit(
+                                f"  No STAC items found for {collection} on {date_str}"
+                            )
+                            continue
+
+                        processed_items += 1
+
+                        merged_any = False
+                        for item in items:
+                            matched_assets = self._match_assets(
+                                section, item, include_bands
+                            )
+                            if matched_assets:
+                                merged_any = True
+                                break
+
+                        if not merged_any:
+                            self._emit(
+                                f"  No matching assets found for {section} on {date_str}"
+                            )
+                            continue
+
+                        self._download_and_merge_assets_multi_item(
                             section=section,
-                            item=item,
-                            matched_assets=matched_assets,
+                            items=items,
+                            include_bands=include_bands,
                             asset_savedir=asset_savedir,
                             anonym=anonym,
                             current_date=current_date,
@@ -420,6 +399,26 @@ class GeoanalyticsDownloader:
                             clip_aoi=self.clip_to_aoi,
                         )
                     else:
+                        item = self._find_stac_item(
+                            collection, current_date, section_endpoints
+                        )
+                        if item is None:
+                            self._emit(
+                                f"  No STAC item found for {collection} on {date_str}"
+                            )
+                            continue
+
+                        processed_items += 1
+
+                        matched_assets = self._match_assets(
+                            section, item, include_bands
+                        )
+                        if not matched_assets:
+                            self._emit(
+                                f"  No matching assets found for {section} on {date_str}"
+                            )
+                            continue
+
                         # Original behavior: download each asset separately
                         self._download_assets_individually(
                             section=section,
@@ -433,6 +432,254 @@ class GeoanalyticsDownloader:
                         )
         finally:
             self.io_client.close()
+
+    def _find_stac_items(
+        self, collection: str, date: pendulum.DateTime, endpoints: List[str]
+    ):
+        period = f"{date.format('YYYY-MM-DD')}/{date.add(days=1).format('YYYY-MM-DD')}"
+        # Optional tolerance (in days) for optical acquisition grouping.
+        # SAR ignores day tolerance and uses the historical non-strict behavior.
+        tolerance = 0
+        try:
+            tolerance = int(self.global_config.get("day_tolerance", "0"))
+        except Exception:
+            tolerance = 0
+        return self.stac_searcher.find_items(
+            collection=collection,
+            bbox=self.bbox,
+            period=period,
+            endpoints=endpoints or STAC_ENDPOINTS,
+            day_tolerance=tolerance,
+        )
+
+    def _download_and_merge_assets_multi_item(
+        self,
+        section: str,
+        items: List[Any],
+        include_bands: List[str],
+        asset_savedir: str,
+        anonym: str,
+        current_date: pendulum.DateTime,
+        resolution: int,
+        clip_aoi: bool = False,
+    ) -> None:
+        """Download and merge outputs using multiple STAC items for a single day.
+
+        The main use-case is Sentinel-2 days where the AOI intersects multiple
+        tiles or a partial tile was acquired. We:
+          1) download each requested band from every candidate item
+          2) mosaic that band across items (fills holes/no-data)
+          3) then stack bands and write a single merged output
+        """
+
+        logger.debug("STAC Item Properties: %s", getattr(items[0], "properties", {}))
+
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from utils import mosaic_tifs
+
+        date_str = current_date.format("YYYY-MM-DD")
+
+        # Establish CRS/resolution settings once for the day.
+        target_resolution = float(resolution) if resolution and resolution > 0 else None
+        target_crs = self._resolve_target_crs(section)
+
+        # Pick the first item that has the expected metadata for merged output attrs.
+        item_for_meta = None
+        for cand in items:
+            if getattr(cand, "assets", None):
+                item_for_meta = cand
+                break
+        if item_for_meta is None:
+            self._emit(
+                f"  No usable STAC items with assets for {section} on {date_str}"
+            )
+            return
+
+        item_id = getattr(item_for_meta, "id", "unknown")
+        cloud_pct = (
+            item_for_meta.properties.get("eo:cloud_cover", None)
+            if hasattr(item_for_meta, "properties")
+            else None
+        )
+        orbit_state = item_for_meta.properties.get("sat:orbit_state", None)
+
+        # For SAR data, we need a Sentinel-2 reference for reliable
+        # georeferencing/alignment before clipping and merging.
+        reference_data = None
+        collection = STAC_COLLECTION_MAP.get(section)
+        is_sar_section = bool(collection and self._is_sar_collection(collection))
+        if is_sar_section:
+            reference_data = self._fetch_reference_data(
+                bbox=self.bbox,
+                target_crs=target_crs,
+                target_resolution=target_resolution,
+            )
+
+        # Multi-item workflow is COG-only.
+        output_format = "cog"
+
+        if self.temp_download_dir:
+            temp_base = Path(self.temp_download_dir)
+            temp_base.mkdir(parents=True, exist_ok=True)
+            temp_dir = temp_base / f"{section}_{date_str}_{self.aoi_name}_multi"
+            temp_dir.mkdir(exist_ok=True)
+            temp_dir_path = str(temp_dir)
+        else:
+            temp_dir_path = tempfile.mkdtemp(prefix=f"{section}_{date_str}_multi_")
+
+        try:
+            # Determine which bands to attempt for this day.
+            bands_to_fetch: List[str] = []
+            # Include only bands that exist in at least one item.
+            for item in items:
+                matched = self._match_assets(section, item, include_bands)
+                for b in matched:
+                    if b not in bands_to_fetch:
+                        bands_to_fetch.append(b)
+
+            if not bands_to_fetch:
+                self._emit(
+                    f"  No matching assets across {len(items)} items for {section} on {date_str}"
+                )
+                return
+
+            self._emit(
+                f"  Found {len(items)} candidate STAC items; mosaicking {len(bands_to_fetch)} bands"
+            )
+
+            # download per-item per-band -> then mosaic per-band
+            mosaicked_band_files: List[str] = []
+            bandnames: List[str] = []
+
+            def _is_valid_raster(path: str) -> bool:
+                if not os.path.exists(path) or os.path.getsize(path) <= 0:
+                    return False
+                try:
+                    import rasterio
+
+                    with rasterio.open(path) as ds:
+                        return bool(ds.width and ds.height and ds.count)
+                except Exception:
+                    return False
+
+            # Clip bbox in EPSG:4326 if needed
+            clip_bbox = self.bbox if clip_aoi else None
+
+            for band in bands_to_fetch:
+                per_item_files: List[str] = []
+
+                for idx, item in enumerate(items):
+                    if band not in getattr(item, "assets", {}):
+                        continue
+
+                    asset = item.assets[band]
+                    suffix = Path(asset.href).suffix or ".tif"
+                    if suffix.lower() in (".jp2", ".jpx", ".jpeg2000"):
+                        suffix = ".tif"
+                    logger.debug(
+                        "Downloading band %s from item %s",
+                        band,
+                        getattr(item, "id", idx),
+                    )
+                    logger.debug("  Asset href: %s", asset.href)
+                    local_path = os.path.join(
+                        temp_dir_path, f"{band.replace('/', '_')}_{idx:02d}{suffix}"
+                    )
+
+                    raster_bands = asset.extra_fields.get("raster:bands", [])
+                    raster_info = raster_bands[0] if raster_bands else {}
+                    dtype = raster_info.get("data_type")
+                    nodata = raster_info.get("nodata")
+
+                    try:
+                        spatial_metadata = self._extract_proj_metadata(asset, item)
+                        self._download_to_local(
+                            asset.href,
+                            local_path,
+                            dtype,
+                            nodata,
+                            spatial_metadata=spatial_metadata,
+                            asset_name=f"{band}#{idx}",
+                            fallback_crs=target_crs,
+                            reference_data=reference_data,
+                            orbit_state=orbit_state,
+                            align_to_reference=bool(reference_data is not None),
+                            clip_bbox=clip_bbox,
+                            target_resolution=target_resolution,
+                        )
+
+                        if _is_valid_raster(local_path):
+                            per_item_files.append(local_path)
+                    except Exception as exc:
+                        self._emit(
+                            f"    Warning: failed downloading {band} from item {getattr(item, 'id', idx)}: {exc}"
+                        )
+
+                if not per_item_files:
+                    self._emit(f"    Warning: band {band} missing across all items")
+                    continue
+
+                if len(per_item_files) == 1:
+                    mosaicked_path = per_item_files[0]
+                else:
+                    # Mosaic across items for this band.
+                    mosaicked_path = os.path.join(
+                        temp_dir_path, f"mosaic_{band.replace('/', '_')}.tif"
+                    )
+                    try:
+                        mosaic_arr, mosaic_transform, mosaic_crs = mosaic_tifs(
+                            per_item_files, dst_crs=target_crs
+                        )
+                        # Write mosaicked raster to disk
+                        import rasterio
+
+                        with rasterio.open(per_item_files[0]) as ref:
+                            meta = ref.meta.copy()
+                        meta.update(
+                            {
+                                "height": mosaic_arr.shape[1],
+                                "width": mosaic_arr.shape[2],
+                                "transform": mosaic_transform,
+                                "crs": mosaic_crs,
+                                "count": mosaic_arr.shape[0],
+                            }
+                        )
+                        with rasterio.open(mosaicked_path, "w", **meta) as dst:
+                            dst.write(mosaic_arr)
+                    except Exception as exc:
+                        self._emit(
+                            f"    Warning: mosaic failed for band {band}: {exc}; using first tile"
+                        )
+                        mosaicked_path = per_item_files[0]
+
+                mosaicked_band_files.append(mosaicked_path)
+                bandnames.append(band)
+
+            if not mosaicked_band_files:
+                self._emit(f"  No bands downloaded for {section} on {date_str}")
+                return
+
+            # Now rely on existing merge logic to stack bands + upload.
+            self._merge_to_single_file(
+                section=section,
+                downloaded_files=mosaicked_band_files,
+                bandnames=bandnames,
+                asset_savedir=asset_savedir,
+                anonym=anonym,
+                current_date=current_date,
+                resolution=resolution,
+                output_format=output_format,
+                item_id=item_id,
+                cloud_pct=cloud_pct,
+                clip_aoi=clip_aoi,
+                target_crs=target_crs,
+            )
+        finally:
+            if os.path.exists(temp_dir_path):
+                shutil.rmtree(temp_dir_path, ignore_errors=True)
 
     def _download_assets_individually(
         self,
@@ -450,6 +697,7 @@ class GeoanalyticsDownloader:
         for asset_key in matched_assets:
             asset = item.assets[asset_key]
             suffix = Path(asset.href).suffix or ".dat"
+            logger.debug("  Asset href: %s", asset.href)
             proposal = asset_key.replace("/", "_")
             filename = (
                 f"{section}_{date_str}_{proposal}_{self.aoi_name}_{resolution}m{suffix}"
@@ -489,7 +737,7 @@ class GeoanalyticsDownloader:
         resolution: int,
         clip_aoi: bool = False,
     ) -> None:
-        """Download assets to temp directory and merge into a single file (COG or Zarr)."""
+        """Download assets to temp directory and merge into a single COG file."""
         import shutil
 
         date_str = current_date.format("YYYY-MM-DD")
@@ -498,19 +746,7 @@ class GeoanalyticsDownloader:
         )
         target_crs = self._resolve_target_crs(section)
 
-        # Check for section-level output format override
-        section_format = ""
-        if section in self.config:
-            section_format = self.config[section].get("output_format", "").lower()
-        output_format = (
-            section_format if section_format in ("cog", "zarr") else self.output_format
-        )
-
-        # Check for hierarchical Zarr mode
-        section_hierarchical = self.config[section].get("hierarchical_zarr", "").lower()
-        use_hierarchical = section_hierarchical == "true" or (
-            section_hierarchical == "" and self.hierarchical_zarr
-        )
+        output_format = "cog"
 
         # Create temp directory for downloads
         if self.temp_download_dir:
@@ -535,30 +771,15 @@ class GeoanalyticsDownloader:
             else None
         )
 
-        # For hierarchical mode, set up the store path early
-        store_path = None
-        scene_id = None
-        if use_hierarchical and output_format == "zarr":
-            scene_id = current_date.format("YYYYMMDD")
-            if self.zarr_store_path:
-                store_path = self.zarr_store_path
-            else:
-                store_filename = f"{section}_{self.aoi_name}_{resolution}m.zarr"
-                store_path = self._build_target_path(
-                    asset_savedir, anonym, "", store_filename
-                ).rstrip("/")
-
-            # Ensure the store exists
-            self._emit(f"  Opening/creating Zarr store: {store_path}")
-            open_or_create_zarr_store(store_path, self.io_client, mode="a")
-
         # For SAR data, fetch a Sentinel-2 reference for spatial alignment
         # Sentinel-1 GRD on AWS Earth Search lacks internal georeferencing
         reference_data = None
         collection = STAC_COLLECTION_MAP.get(section)
         is_sar_section = bool(collection and self._is_sar_collection(collection))
 
-        upload_raw_sar = self._resolve_upload_raw_sar(section) if is_sar_section else False
+        upload_raw_sar = (
+            self._resolve_upload_raw_sar(section) if is_sar_section else False
+        )
         upload_aligned_raw_sar = (
             self._resolve_upload_aligned_raw_sar(section) if is_sar_section else False
         )
@@ -638,11 +859,10 @@ class GeoanalyticsDownloader:
                             orbit_state=orbit_state,
                             align_to_reference=False,
                             clip_bbox=self.bbox if clip_aoi else None,
+                            target_resolution=target_resolution,
                         )
 
-                        raw_filename = (
-                            f"{section}_{date_str}_{asset_key.replace('/', '_')}_RAW.tif"
-                        )
+                        raw_filename = f"{section}_{date_str}_{asset_key.replace('/', '_')}_RAW.tif"
                         raw_target_path = self._build_target_path(
                             asset_savedir,
                             anonym,
@@ -650,7 +870,10 @@ class GeoanalyticsDownloader:
                             raw_filename,
                         )
 
-                        if os.path.exists(raw_local_path) and os.path.getsize(raw_local_path) > 1024:
+                        if (
+                            os.path.exists(raw_local_path)
+                            and os.path.getsize(raw_local_path) > 1024
+                        ):
                             if not self.skip_uploads:
                                 self.io_client.submit_copy(
                                     raw_local_path,
@@ -658,6 +881,7 @@ class GeoanalyticsDownloader:
                                     dtype="uint16" if dtype is None else dtype,
                                     nodata=nodata,
                                     clip_bbox=None,
+                                    target_resolution=target_resolution,
                                 )
                         else:
                             self._emit(
@@ -680,11 +904,10 @@ class GeoanalyticsDownloader:
                             orbit_state=orbit_state,
                             align_to_reference=False,
                             clip_bbox=self.bbox if clip_aoi else None,
+                            target_resolution=target_resolution,
                         )
 
-                        aligned_raw_filename = (
-                            f"{section}_{date_str}_{asset_key.replace('/', '_')}_ALIGNED_RAW.tif"
-                        )
+                        aligned_raw_filename = f"{section}_{date_str}_{asset_key.replace('/', '_')}_ALIGNED_RAW.tif"
                         aligned_raw_target_path = self._build_target_path(
                             asset_savedir,
                             anonym,
@@ -703,6 +926,7 @@ class GeoanalyticsDownloader:
                                     dtype="uint16" if dtype is None else dtype,
                                     nodata=nodata,
                                     clip_bbox=None,
+                                    target_resolution=target_resolution,
                                 )
                         else:
                             self._emit(
@@ -720,8 +944,11 @@ class GeoanalyticsDownloader:
                         fallback_crs=target_crs,
                         reference_data=reference_data,
                         orbit_state=orbit_state,
-                        align_to_reference=bool(is_sar_section and reference_data is not None),
+                        align_to_reference=bool(
+                            is_sar_section and reference_data is not None
+                        ),
                         clip_bbox=self.bbox if clip_aoi else None,
+                        target_resolution=target_resolution,
                     )
                     if (
                         os.path.exists(local_path)
@@ -730,29 +957,7 @@ class GeoanalyticsDownloader:
                         downloaded_files.append(local_path)
                         bandnames.append(asset_key)
 
-                        # Hierarchical mode: write band to Zarr immediately after download
-                        if (
-                            use_hierarchical
-                            and output_format == "zarr"
-                            and self.write_individual_bands
-                        ):
-                            self._emit(f"      Writing {asset_key} to Zarr...")
-                            try:
-                                write_band_to_zarr_group(
-                                    tif_path=local_path,
-                                    store_path=store_path,
-                                    group_path=f"{scene_id}/bands",
-                                    band_name=asset_key,
-                                    io_client=self.io_client,
-                                    chunks=(self.zarr_chunks[1], self.zarr_chunks[2]),
-                                    stac_item_id=item_id,
-                                    date=date_str,
-                                    cloud_cover=cloud_pct,
-                                )
-                            except Exception as band_exc:
-                                self._emit(
-                                    f"      Warning: Failed to write band to Zarr: {band_exc}"
-                                )
+                        # Zarr support removed; no incremental band writes.
 
                 except Exception as exc:
                     self._emit(f"      Failed to download {asset.href}: {exc}")
@@ -763,64 +968,21 @@ class GeoanalyticsDownloader:
                 )
                 return
 
-            # Hierarchical Zarr mode: now create the merged group from downloaded files
-            if use_hierarchical and output_format == "zarr":
-                self._emit(
-                    f"  Creating merged group from {len(downloaded_files)} bands..."
-                )
-                # Determine clip_bbox for this operation
-                clip_bbox = self.bbox if clip_aoi else None
-                try:
-                    context = MergeContext(
-                        section=section,
-                        date_str=date_str,
-                        item_id=item_id,
-                        aoi_name=self.aoi_name,
-                        resolution=resolution,
-                        clip_bbox=clip_bbox,
-                        cloud_cover=cloud_pct,
-                        target_crs=target_crs,
-                        target_resolution=target_resolution,
-                    )
-
-                    merger = build_merge_strategy(
-                        output_format="zarr",
-                        hierarchical=True,
-                        hierarchical_spec=HierarchicalZarrSpec(
-                            store_path=str(store_path),
-                            group_path=f"{scene_id}/merged",
-                        ),
-                    )
-                    merger.merge(
-                        tif_files=downloaded_files,
-                        bandnames=bandnames,
-                        output_path=str(store_path),
-                        io_client=self.io_client,
-                        context=context,
-                        chunks=self.zarr_chunks,
-                    )
-                    self._emit(
-                        f"  Successfully ingested scene to {store_path}/{scene_id}/"
-                    )
-                except Exception as exc:
-                    self._emit(f"  Failed to create merged group: {exc}")
-                    raise
-            else:
-                # Original mode: separate file per scene
-                self._merge_to_single_file(
-                    section=section,
-                    downloaded_files=downloaded_files,
-                    bandnames=bandnames,
-                    asset_savedir=asset_savedir,
-                    anonym=anonym,
-                    current_date=current_date,
-                    resolution=resolution,
-                    output_format=output_format,
-                    item_id=item_id,
-                    cloud_pct=cloud_pct,
-                    clip_aoi=clip_aoi,
-                    target_crs=target_crs,
-                )
+            # Original mode: separate file per scene
+            self._merge_to_single_file(
+                section=section,
+                downloaded_files=downloaded_files,
+                bandnames=bandnames,
+                asset_savedir=asset_savedir,
+                anonym=anonym,
+                current_date=current_date,
+                resolution=resolution,
+                output_format=output_format,
+                item_id=item_id,
+                cloud_pct=cloud_pct,
+                clip_aoi=clip_aoi,
+                target_crs=target_crs,
+            )
 
         finally:
             # Clean up temp directory
@@ -852,15 +1014,10 @@ class GeoanalyticsDownloader:
         # Determine clip_bbox from clip_aoi flag
         clip_bbox = self.bbox if clip_aoi else None
 
-        # Build output path for merged file
-        if output_format == "zarr":
-            merged_filename = (
-                f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.zarr"
-            )
-        else:
-            merged_filename = (
-                f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.tif"
-            )
+        # Build output path for merged file (COG-only)
+        merged_filename = (
+            f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.tif"
+        )
 
         merged_target_path = self._build_target_path(
             asset_savedir,
@@ -904,11 +1061,19 @@ class GeoanalyticsDownloader:
             # strategy often creates a local temp file first. If you want QA for
             # remote-only outputs, use io_client to stage a local copy.
             try:
-                if self.qa_quicklooks and isinstance(merged_target_path, str) and merged_target_path.endswith(".tif"):
+                if (
+                    self.qa_quicklooks
+                    and isinstance(merged_target_path, str)
+                    and merged_target_path.endswith(".tif")
+                ):
                     # If the output is remote (abfs/s3), we can't open it without
                     # extra plumbing. Skip and rely on per-band quicklooks.
-                    if merged_target_path.startswith("abfs://") or merged_target_path.startswith("s3://"):
-                        self._emit("  QA quicklook skipped for remote merged output (enable staging if needed)")
+                    if merged_target_path.startswith(
+                        "abfs://"
+                    ) or merged_target_path.startswith("s3://"):
+                        self._emit(
+                            "  QA quicklook skipped for remote merged output (enable staging if needed)"
+                        )
                     else:
                         qa_dir = Path(self.qa_quicklook_dir)
                         qa_dir.mkdir(parents=True, exist_ok=True)
@@ -917,7 +1082,9 @@ class GeoanalyticsDownloader:
                         meta_path = str(qa_dir / f"{base}.json")
                         png_path = str(qa_dir / f"{base}.png")
 
-                        write_raster_metadata_json(raster_path=merged_target_path, output_json=meta_path)
+                        write_raster_metadata_json(
+                            raster_path=merged_target_path, output_json=meta_path
+                        )
                         render_quicklook(
                             QuicklookRequest(
                                 raster_path=merged_target_path,
@@ -947,6 +1114,7 @@ class GeoanalyticsDownloader:
         orbit_state: Optional[str] = None,
         align_to_reference: bool = False,
         clip_bbox: Optional[List[float]] = None,
+        target_resolution: Optional[float] = None,
     ) -> None:
         """Download a remote asset to a local file.
 
@@ -967,6 +1135,7 @@ class GeoanalyticsDownloader:
             align_to_reference=align_to_reference,
             clip_bbox=clip_bbox,
             clip_bbox_crs="EPSG:4326",
+            target_resolution=target_resolution,
         )
 
         RasterDownloader(self.io_client).download_to_local(req)
@@ -1267,7 +1436,9 @@ class GeoanalyticsDownloader:
         start = getattr(self, "start_date", None)
         if start is None:
             return None
-        period = f"{start.format('YYYY-MM-DD')}/{start.add(days=1).format('YYYY-MM-DD')}"
+        period = (
+            f"{start.format('YYYY-MM-DD')}/{start.add(days=1).format('YYYY-MM-DD')}"
+        )
 
         item = self.stac_searcher.find_item(
             collection=collection,
@@ -1285,7 +1456,10 @@ class GeoanalyticsDownloader:
                 asset_key = candidate
                 break
         if asset_key is None:
-            logger.warning("Reference item %s has no expected band assets", getattr(item, "id", "unknown"))
+            logger.warning(
+                "Reference item %s has no expected band assets",
+                getattr(item, "id", "unknown"),
+            )
             return None
 
         href = item.assets[asset_key].href
@@ -1293,7 +1467,6 @@ class GeoanalyticsDownloader:
         # Download the reference asset to a temp file and open it with rioxarray.
         # We keep it local because downstream alignment happens locally.
         try:
-            import tempfile
             import fsspec
             import rioxarray as rxr
 
@@ -1301,7 +1474,9 @@ class GeoanalyticsDownloader:
             with fsspec.open(href, "rb", **reader_opts) as reader_file:
                 with rxr.open_rasterio(reader_file) as ds:
                     # Ensure CRS/transform exist as best-effort.
-                    spatial_metadata = self._extract_proj_metadata(item.assets[asset_key], item)
+                    spatial_metadata = self._extract_proj_metadata(
+                        item.assets[asset_key], item
+                    )
                     ds = self._apply_spatial_metadata(
                         ds,
                         spatial_metadata,
@@ -1580,6 +1755,14 @@ class GeoanalyticsDownloader:
 
     def _match_assets(self, section: str, item, include_bands: List[str]) -> List[str]:
         """Resolve configured band names to available STAC asset keys for a dataset."""
+        # For RGB products we only ever want the single rendered asset.
+        # Downloading multiple analytical bands for "RGB" sections explodes I/O and
+        # defeats the purpose of having an RGB convenience product.
+        if "RGB" in section.upper():
+            visual = [k for k in item.assets.keys() if k.lower() == "visual"]
+            if visual:
+                return visual
+
         if not include_bands:
             return self.asset_policy.filter_assets(section, list(item.assets.keys()))
 
