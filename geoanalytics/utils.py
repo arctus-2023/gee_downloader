@@ -381,41 +381,32 @@ def merge_download_dir(
 
     return dst_crs
 
-
 def merge_downloaded_assets_to_cog(
     tif_files: List[str],
     output_path: str,
-    io_client,
-    bandnames: Optional[List[str]] = None,
-    descriptions: Optional[str] = None,
-    dst_crs=None,
-    compression: str = "deflate",
-    remove_temp: bool = True,
-    clip_bbox: Optional[List[float]] = None,
-    **extra_tags,
-) -> str:
+    io_client: Optional[GeoanalyticsIOClient],
+    bandnames: List[str],
+    descriptions: str,
+    remove_temp: bool = False,
+    cloud_percentage: Optional[float] = None,
+    clip_bbox: Optional[Tuple[float, float, float, float]] = None,
+    target_resolution: float = 10.0,  # Add this parameter with default 10m
+) -> None:
     """
     Stack multiple downloaded single-band TIF files and write as a Cloud Optimized GeoTIFF (COG).
-
-    This function is designed for the geoanalytics workflow where individual band
-    files are downloaded from remote sources and need to be stacked into a single
-    multi-band COG for storage.
-
-    Args:
-        tif_files: List of local paths to single-band TIF files to stack.
-        output_path: Target path (can be local, abfs://, s3://, etc.).
-        io_client: GeoanalyticsIOClient instance for writing to cloud storage.
-        bandnames: Optional list of band names for the output.
-        descriptions: Optional description string to embed.
-        dst_crs: Target CRS. If None, uses CRS from input files.
-        compression: COG compression method (default: deflate).
-        remove_temp: If True, removes source TIF files after successful merge.
-        clip_bbox: Optional bounding box [minx, miny, maxx, maxy] to clip output to.
-        **extra_tags: Additional metadata tags to write.
-
-    Returns:
-        The output path where the file was written.
     """
+    import tempfile
+    import fsspec
+
+    # Handle storage options based on whether io_client exists
+    if io_client is not None:
+        writer_opts = io_client._storage_options(output_path, write=True)
+    else:
+        # Local file system - no special storage options needed
+        writer_opts = {}
+        # Ensure output directory exists for local paths
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     if not tif_files:
         raise ValueError("No TIF files provided for stacking")
 
@@ -425,9 +416,12 @@ def merge_downloaded_assets_to_cog(
         raise DownloadDirIncompleteError("No valid TIF files found (all below 20KB)")
 
     try:
-        # Stack bands into a single array
+        # Stack bands into a single array with 10m resolution
         stacked, out_trans, dst_crs_ret, metadata = stack_bands(
-            valid_tifs, dst_crs=dst_crs, clip_bbox=clip_bbox
+            valid_tifs,
+            dst_crs=None,
+            clip_bbox=clip_bbox,
+            target_resolution=target_resolution
         )
 
         # Build output metadata
@@ -455,8 +449,8 @@ def merge_downloaded_assets_to_cog(
             with rasterio.open(tmp_src_path, "w", **out_meta) as dst:
                 if descriptions:
                     dst.update_tags(info=descriptions)
-                for key, value in extra_tags.items():
-                    dst.update_tags(**{key: value})
+                if cloud_percentage is not None:
+                    dst.update_tags(cloud_percentage=cloud_percentage)
                 dst.write(stacked)
                 if bandnames:
                     dst.descriptions = tuple(bandnames[: stacked.shape[0]])
@@ -465,7 +459,7 @@ def merge_downloaded_assets_to_cog(
                     dst.update_tags(clip_bbox=str(clip_bbox))
 
             # Convert to COG
-            cog_profile = cog_profiles.get(compression)
+            cog_profile = cog_profiles.get("deflate")
             cog_profile.update(
                 {
                     "blockxsize": 256,
@@ -487,8 +481,7 @@ def merge_downloaded_assets_to_cog(
                 in_memory=False,
             )
 
-            # Write to output (handles cloud storage via io_client)
-            writer_opts = io_client._storage_options(output_path, write=True)
+            # Write to output (handles both local and cloud storage)
             with open(tmp_cog_path, "rb") as src_file:
                 with fsspec.open(
                     output_path, "wb", auto_mkdir=True, **writer_opts
@@ -1107,16 +1100,14 @@ def ingest_scene_to_zarr_store(
 def merge_downloaded_assets_to_zarr(
     tif_files: List[str],
     output_path: str,
-    io_client,
-    bandnames: Optional[List[str]] = None,
-    descriptions: Optional[str] = None,
-    dst_crs=None,
-    chunks: Tuple[int, int, int] = (1, 512, 512),
-    remove_temp: bool = True,
-    parallel: bool = True,
-    clip_bbox: Optional[List[float]] = None,
-    **extra_attrs,
-) -> str:
+    io_client: Optional[GeoanalyticsIOClient],
+    bandnames: List[str],
+    descriptions: str,
+    chunks: Dict[str, int],
+    remove_temp: bool = False,
+    cloud_percentage: Optional[float] = None,
+    clip_bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> None:
     """
     Stack multiple downloaded single-band TIF files and write as a Zarr dataset.
 
@@ -1151,6 +1142,12 @@ def merge_downloaded_assets_to_zarr(
         )
         ```
     """
+    if io_client is not None:
+        writer_opts = io_client._storage_options(output_path, write=True)
+    else:
+        writer_opts = {}
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     if not tif_files:
         raise ValueError("No TIF files provided for stacking")
 

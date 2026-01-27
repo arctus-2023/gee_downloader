@@ -154,10 +154,19 @@ class GeoanalyticsDownloader:
         self.global_config = config["GLOBAL"]
         self.dry_run = dry_run
 
-        io_config = IOConfig(
-            adl_account=self.global_config.get("adl_account_name"),
-        )
-        self.io_client = GeoanalyticsIOClient(io_config)
+        # Determine output mode: "local" or "cloud"
+        self.output_mode = self.global_config.get("output_mode", "local").lower()
+        if self.output_mode not in ("local", "cloud"):
+            raise ValueError(f"output_mode must be 'local' or 'cloud', got '{self.output_mode}'")
+
+        # Only initialize IO client if using cloud storage
+        if self.output_mode == "cloud":
+            io_config = IOConfig(
+                adl_account=self.global_config.get("adl_account_name"),
+            )
+            self.io_client = GeoanalyticsIOClient(io_config)
+        else:
+            self.io_client = None
 
         self.aoi_path = aoi_path_override or self.global_config.get("aoi") or ""
         if not self.aoi_path:
@@ -317,7 +326,8 @@ class GeoanalyticsDownloader:
                             clip_aoi=self.clip_to_aoi,
                         )
         finally:
-            self.io_client.close()
+            if self.io_client:
+                self.io_client.close()
 
     def _download_assets_individually(
         self,
@@ -557,34 +567,28 @@ class GeoanalyticsDownloader:
                 shutil.rmtree(temp_dir_path, ignore_errors=True)
 
     def _merge_to_single_file(
-        self,
-        section: str,
-        downloaded_files: List[str],
-        bandnames: List[str],
-        asset_savedir: str,
-        anonym: str,
-        current_date: pendulum.DateTime,
-        resolution: int,
-        output_format: str,
-        item_id: str,
-        cloud_pct: float | None,
-        clip_aoi: bool = False,
+            self,
+            section: str,
+            downloaded_files: List[str],
+            bandnames: List[str],
+            asset_savedir: str,
+            anonym: str,
+            current_date: pendulum.DateTime,
+            resolution: int,
+            output_format: str,
+            item_id: str,
+            cloud_pct: float | None,
+            clip_aoi: bool = False,
     ) -> None:
-        """Merge downloaded files into a single output file (original behavior)."""
+        """Merge downloaded files into a single output file."""
         date_str = current_date.format("YYYY-MM-DD")
 
-        # Determine clip_bbox from clip_aoi flag
         clip_bbox = self.bbox if clip_aoi else None
 
-        # Build output path for merged file
         if output_format == "zarr":
-            merged_filename = (
-                f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.zarr"
-            )
+            merged_filename = f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.zarr"
         else:
-            merged_filename = (
-                f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.tif"
-            )
+            merged_filename = f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.tif"
 
         merged_target_path = self._build_target_path(
             asset_savedir,
@@ -593,18 +597,18 @@ class GeoanalyticsDownloader:
             merged_filename,
         )
 
-        print(
-            f"  Merging {len(downloaded_files)} files into {merged_target_path} (format: {output_format})..."
-        )
+        print(f"  Merging {len(downloaded_files)} files into {merged_target_path} (format: {output_format})...")
 
         try:
             descriptions = f"{section}:{date_str}:{item_id}"
 
             if output_format == "zarr":
+                # Use IO client only in cloud mode
+                io_arg = self.io_client if self.output_mode == "cloud" else None
                 merge_downloaded_assets_to_zarr(
                     tif_files=downloaded_files,
                     output_path=merged_target_path,
-                    io_client=self.io_client,
+                    io_client=io_arg,
                     bandnames=bandnames,
                     descriptions=descriptions,
                     chunks=self.zarr_chunks,
@@ -613,29 +617,38 @@ class GeoanalyticsDownloader:
                     clip_bbox=clip_bbox,
                 )
             else:
+                io_arg = self.io_client if self.output_mode == "cloud" else None
                 merge_downloaded_assets_to_cog(
                     tif_files=downloaded_files,
                     output_path=merged_target_path,
-                    io_client=self.io_client,
+                    io_client=io_arg,
                     bandnames=bandnames,
                     descriptions=descriptions,
                     remove_temp=False,
                     cloud_percentage=cloud_pct,
                     clip_bbox=clip_bbox,
                 )
-            print(f"  Successfully merged and uploaded to {merged_target_path}")
+            print(f"  Successfully merged and saved to {merged_target_path}")
         except Exception as exc:
             print(f"  Failed to merge assets: {exc}")
             raise
 
     def _download_to_local(
-        self, href: str, local_path: str, dtype: str, nodata: float | None
+            self, href: str, local_path: str, dtype: str, nodata: float | None
     ) -> None:
         """Download a remote asset to a local file, converting to GeoTIFF if needed."""
         import fsspec
         import rioxarray as rxr
 
-        reader_opts = self.io_client._storage_options(href)
+        # Determine storage options based on URL scheme
+        if self.output_mode == "local":
+            # For S3 URLs, use anonymous access for public buckets
+            if href.startswith("s3://"):
+                reader_opts = {"anon": True}
+            else:
+                reader_opts = {}
+        else:
+            reader_opts = self.io_client._storage_options(href)
 
         with fsspec.open(href, "rb", **reader_opts) as reader_file:
             with rxr.open_rasterio(reader_file) as dataset:
@@ -645,6 +658,9 @@ class GeoanalyticsDownloader:
                     dataset = dataset.rio.write_nodata(nodata, encoded=True)
                 if dtype:
                     dataset = dataset.astype(dtype)
+
+                # Ensure output directory exists
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
                 # Write as GeoTIFF
                 dataset.rio.to_raster(local_path, driver="GTiff")
@@ -675,9 +691,12 @@ class GeoanalyticsDownloader:
                 if item is not None:
                     return item
             except APIError as exc:
-                print(
-                    f"  STAC endpoint {endpoint} rejected sort/query: {exc}. Retrying without sort..."
-                )
+                error_msg = str(exc).lower()
+                if "sort" in error_msg or "mapping" in error_msg:
+                    print(
+                        f"  STAC endpoint {endpoint} doesn't support sorting by eo:cloud_cover. Retrying without sort...")
+                else:
+                    print(f"  STAC endpoint {endpoint} rejected sort/query: {exc}. Retrying without sort...")
             except Exception as exc:  # unexpected errors
                 print(f"  STAC search failed at {endpoint}: {exc}")
 
@@ -696,7 +715,7 @@ class GeoanalyticsDownloader:
             except Exception as exc:
                 print(f"  STAC fallback (no-sort) failed at {endpoint}: {exc}")
 
-            # Fallback 2: try without query (some indices may not index eo:cloud_cover)
+            # Fallback 2: try without query
             try:
                 search = client.search(
                     collections=[collection],
@@ -923,18 +942,22 @@ class GeoanalyticsDownloader:
                 y_values.append(coord[1])
 
     def _copy_asset(
-        self,
-        href: str,
-        target_path: str,
-        dtype: str,
-        nodata: float | None,
-        clip_aoi: bool = False,
+            self,
+            href: str,
+            target_path: str,
+            dtype: str,
+            nodata: float | None,
+            clip_aoi: bool = False,
     ) -> None:
-        # Pass the AOI bounding box when clipping is enabled
-        clip_bbox = self.bbox if clip_aoi else None
-        future = self.io_client.submit_copy(href, target_path, dtype, nodata, clip_bbox)
-        if future is not None:
-            future.result()
+        if self.output_mode == "local":
+            # For local mode, download directly
+            self._download_to_local(href, target_path, dtype, nodata)
+        else:
+            # For cloud mode, use IO client
+            clip_bbox = self.bbox if clip_aoi else None
+            future = self.io_client.submit_copy(href, target_path, dtype, nodata, clip_bbox)
+            if future is not None:
+                future.result()
 
     def _build_target_path(
             self, asset_dir: str, anonym: str, date_token: str, filename: str
