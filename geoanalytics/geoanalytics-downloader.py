@@ -615,7 +615,7 @@ class GeoanalyticsDownloader:
             for asset_key in matched_assets:
                 asset = item.assets[asset_key]
 
-                # Check if this is metadata
+                # Check if this is metadata if exist
                 if self._is_metadata_asset(asset_key, asset):
                     suffix = Path(asset.href).suffix or ".json"
                     metadata_filename = f"{asset_key.replace('/', '_')}{suffix}"
