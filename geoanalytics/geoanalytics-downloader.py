@@ -22,6 +22,7 @@ from utils import (
     write_band_to_zarr_group,
     write_merged_to_zarr_group,
 )
+import geopandas as gpd
 
 STAC_ENDPOINTS = [
     "https://earth-search.aws.element84.com/v1",
@@ -237,6 +238,43 @@ class GeoanalyticsDownloader:
         # If not set, will be derived from save_dir and collection name
         self.zarr_store_path = self.global_config.get("zarr_store_path", "")
 
+    def _is_metadata_asset(self, asset_key: str, asset) -> bool:
+        """Check if an asset is metadata (not a raster band)."""
+        if asset is None:
+            return True
+
+        # Common metadata asset keys
+        metadata_keywords = [
+            "metadata",
+            "inspire",
+            "product_metadata",
+            "granule_metadata",
+            "datastrip_metadata",
+            "tileinfo_metadata",
+            "manifest",
+            "preview",
+            "thumbnail",
+        ]
+
+        # Check asset key
+        key_lower = asset_key.lower()
+        if any(keyword in key_lower for keyword in metadata_keywords):
+            return True
+
+        # Check asset media type
+        if hasattr(asset, "media_type"):
+            media_type = asset.media_type or ""
+            if "xml" in media_type.lower() or "json" in media_type.lower() or "text" in media_type.lower():
+                return True
+
+        # Check asset href extension
+        if hasattr(asset, "href"):
+            href_lower = asset.href.lower()
+            if href_lower.endswith((".xml", ".json", ".txt", ".html", ".htm")):
+                return True
+
+        return False
+
     def _parse_chunks(self, chunks_str: str) -> tuple[int, int, int]:
         """Parse chunk size string like '1,512,512' into a tuple."""
         try:
@@ -257,77 +295,172 @@ class GeoanalyticsDownloader:
 
     def run(self) -> None:
         print("Starting Geoanalytics download workflow")
+
+        # Load shapefile/GeoJSON with geopandas
+        if self.aoi_path.startswith(("abfs://", "az://")):
+            # Cloud storage - use io_client
+            aoi_gdf = self.io_client.load_remote_aoi_gdf(self.aoi_path)
+        else:
+            # Local file
+            aoi_gdf = gpd.read_file(self.aoi_path)
+
         try:
-            for section in self.asset_order:
-                if section not in self.config:
-                    print(f"Skipping {section}: configuration missing")
-                    continue
-                asset_config = self.config[section]
-                collection = STAC_COLLECTION_MAP.get(section)
-                if collection is None:
-                    print(f"No STAC mapping available for {section}; skipping")
-                    continue
+            # Iterate through each polygon in the shapefile
+            for idx, row in aoi_gdf.iterrows():
+                geometry = row['geometry']
 
-                include_bands = _safe_split(asset_config.get("include_bands", ""))
+                # Get polygon name from 'name' field or use index
+                polygon_name = str(row['name']) if 'name' in row else str(idx)
+
+                print(f"\n{'=' * 60}")
+                print(f"Processing AOI: {polygon_name} ({idx + 1}/{len(aoi_gdf)})")
+                print(f"{'=' * 60}")
+
+                # Update instance variables for this polygon
+                self.aoi_name = polygon_name
+                self.aoi_geo = geometry
+                self.bbox = list(geometry.bounds)  # (minx, miny, maxx, maxy)
+
                 try:
-                    resolution = int(asset_config.get("resolution", "0"))
-                except ValueError:
-                    resolution = 0
+                    # Process all sections for this polygon
+                    for section in self.asset_order:
+                        if section not in self.config:
+                            print(f"Skipping {section}: configuration missing")
+                            continue
 
-                anonym = asset_config.get("anonym", section)
-                asset_savedir = asset_config.get("save_dir", "misc")
+                        asset_config = self.config[section]
+                        collection = STAC_COLLECTION_MAP.get(section)
+                        if collection is None:
+                            print(f"No STAC mapping available for {section}; skipping")
+                            continue
 
-                # Check if this section should merge outputs
-                section_merge = asset_config.get("merge_outputs", "").lower()
-                should_merge = section_merge == "true" or (
-                    section_merge == "" and self.merge_outputs
-                )
+                        include_bands = _safe_split(asset_config.get("include_bands", ""))
+                        try:
+                            resolution = int(asset_config.get("resolution", "0"))
+                        except ValueError:
+                            resolution = 0
 
-                for current_date in self._iter_dates():
-                    date_str = current_date.format("YYYY-MM-DD")
-                    print(f"Processing {section} for {date_str}")
-                    if self.dry_run:
-                        print(f"  [dry-run] would search {collection} for {date_str}")
-                        continue
+                        anonym = asset_config.get("anonym", section)
+                        asset_savedir = asset_config.get("save_dir", "misc")
 
-                    item = self._find_stac_item(collection, current_date)
-                    if item is None:
-                        print(f"  No STAC item found for {collection} on {date_str}")
-                        continue
-
-                    matched_assets = self._match_assets(section, item, include_bands)
-                    if not matched_assets:
-                        print(f"  No matching assets found for {section} on {date_str}")
-                        continue
-
-                    if should_merge:
-                        # Download to temp directory and merge
-                        self._download_and_merge_assets(
-                            section=section,
-                            item=item,
-                            matched_assets=matched_assets,
-                            asset_savedir=asset_savedir,
-                            anonym=anonym,
-                            current_date=current_date,
-                            resolution=resolution,
-                            include_bands=include_bands,
-                            clip_aoi=self.clip_to_aoi,
+                        # Check if this section should merge outputs
+                        section_merge = asset_config.get("merge_outputs", "").lower()
+                        should_merge = section_merge == "true" or (
+                                section_merge == "" and self.merge_outputs
                         )
-                    else:
-                        # Original behavior: download each asset separately
-                        self._download_assets_individually(
-                            section=section,
-                            item=item,
-                            matched_assets=matched_assets,
-                            asset_savedir=asset_savedir,
-                            anonym=anonym,
-                            current_date=current_date,
-                            resolution=resolution,
-                            clip_aoi=self.clip_to_aoi,
-                        )
+
+                        for current_date in self._iter_dates():
+                            date_str = current_date.format("YYYY-MM-DD")
+                            print(f"Processing {section} for {date_str}")
+                            if self.dry_run:
+                                print(f"  [dry-run] would search {collection} for {date_str}")
+                                continue
+
+                            item = self._find_stac_item(collection, current_date)
+                            if item is None:
+                                print(f"  No STAC item found for {collection} on {date_str}")
+                                continue
+
+                            matched_assets = self._match_assets(section, item, include_bands)
+                            if not matched_assets:
+                                print(f"  No matching assets found for {section} on {date_str}")
+                                continue
+
+                            if should_merge:
+                                self._download_and_merge_assets(
+                                    section=section,
+                                    item=item,
+                                    matched_assets=matched_assets,
+                                    asset_savedir=asset_savedir,
+                                    anonym=anonym,
+                                    current_date=current_date,
+                                    resolution=resolution,
+                                    include_bands=include_bands,
+                                    clip_aoi=self.clip_to_aoi,
+                                )
+                            else:
+                                self._download_assets_individually(
+                                    section=section,
+                                    item=item,
+                                    matched_assets=matched_assets,
+                                    asset_savedir=asset_savedir,
+                                    anonym=anonym,
+                                    current_date=current_date,
+                                    resolution=resolution,
+                                    clip_aoi=self.clip_to_aoi,
+                                )
+                except Exception as exc:
+                    print(f"Error processing polygon {polygon_name}: {exc}")
+                    continue
         finally:
             if self.io_client:
                 self.io_client.close()
+
+    def _extract_geometry_from_item(self, item, asset_key: str) -> dict:
+        """Extract solar and viewing geometry from STAC item properties."""
+        geometry = {}
+
+        # Solar angles
+        if hasattr(item, 'properties'):
+            props = item.properties
+
+            # Sentinel-2 style
+            geometry['sun_azimuth'] = props.get('view:sun_azimuth')
+            geometry['sun_elevation'] = props.get('view:sun_elevation')
+
+            # Convert elevation to zenith if needed
+            if geometry['sun_elevation'] is not None:
+                geometry['sun_zenith'] = 90.0 - geometry['sun_elevation']
+
+            # Viewing angles (if available)
+            geometry['view_azimuth'] = props.get('view:azimuth')
+            geometry['view_zenith'] = props.get('view:off_nadir')
+
+            # Cloud cover
+            geometry['cloud_cover'] = props.get('eo:cloud_cover')
+            return {k: v for k, v in geometry.items() if v is not None}
+
+    def _add_geometry_to_cog(self, output_path: str, geometry: dict, item_id: str):
+        """Add geometry metadata as tags to COG file."""
+        import rasterio
+
+        if not geometry:
+            return
+
+        with rasterio.open(output_path, 'r+') as dst:
+            tags = {
+                'product_id': item_id,
+                'sun_azimuth': str(geometry.get('sun_azimuth', '')),
+                'sun_zenith': str(geometry.get('sun_zenith', '')),
+                'view_azimuth': str(geometry.get('view_azimuth', '')),
+                'view_zenith': str(geometry.get('view_zenith', '')),
+                'cloud_cover': str(geometry.get('cloud_cover', '')),
+            }
+            dst.update_tags(**tags)
+
+    def _add_geometry_to_zarr(self, store_path: str, scene_id: str, geometry: dict, item_id: str):
+        """Add geometry metadata as Zarr attributes."""
+        import zarr
+
+        if not geometry:
+            return
+
+        if store_path.startswith(("abfs://", "az://", "s3://", "gs://")):
+            store = self.io_client.get_mapper(store_path)
+        else:
+            store = store_path
+
+        root = zarr.open(store, mode='r+')
+        scene_group = root[scene_id]
+
+        scene_group.attrs.update({
+            'product_id': item_id,
+            'sun_azimuth': geometry.get('sun_azimuth'),
+            'sun_zenith': geometry.get('sun_zenith'),
+            'view_azimuth': geometry.get('view_azimuth'),
+            'view_zenith': geometry.get('view_zenith'),
+            'cloud_cover': geometry.get('cloud_cover'),
+        })
 
     def _download_assets_individually(
         self,
@@ -374,21 +507,24 @@ class GeoanalyticsDownloader:
                 print(f"    Failed to copy {asset.href}: {exc}")
 
     def _download_and_merge_assets(
-        self,
-        section: str,
-        item,
-        matched_assets: List[str],
-        asset_savedir: str,
-        anonym: str,
-        current_date: pendulum.DateTime,
-        resolution: int,
-        include_bands: List[str],
-        clip_aoi: bool = False,
+            self,
+            section: str,
+            item,
+            matched_assets: List[str],
+            asset_savedir: str,
+            anonym: str,
+            current_date: pendulum.DateTime,
+            resolution: int,
+            include_bands: List[str],
+            clip_aoi: bool = False,
     ) -> None:
         """Download assets to temp directory and merge into a single file (COG or Zarr)."""
         import shutil
+        import tempfile
+        import rasterio
 
         date_str = current_date.format("YYYY-MM-DD")
+        date_token = current_date.format("YYYYMMDD")
 
         # Check for section-level output format override
         section_format = ""
@@ -401,8 +537,51 @@ class GeoanalyticsDownloader:
         # Check for hierarchical Zarr mode
         section_hierarchical = self.config[section].get("hierarchical_zarr", "").lower()
         use_hierarchical = section_hierarchical == "true" or (
-            section_hierarchical == "" and self.hierarchical_zarr
+                section_hierarchical == "" and self.hierarchical_zarr
         )
+
+        # Build output path early
+        if use_hierarchical and output_format == "zarr":
+            scene_id = date_token
+            if self.zarr_store_path:
+                store_path = self.zarr_store_path
+            else:
+                store_filename = f"{section}_{self.aoi_name}_{resolution}m_merged.zarr"
+                store_path = self._build_target_path(
+                    asset_savedir, anonym, "", store_filename
+                )
+            output_path = f"{store_path}/{scene_id}/merged"
+        else:
+            if output_format == "cog":
+                output_filename = f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.tif"
+            else:
+                output_filename = f"{section}_{date_str}_{self.aoi_name}_{resolution}m_merged.zarr"
+            output_path = self._build_target_path(
+                asset_savedir, anonym, date_token, output_filename
+            )
+
+        # ===== EARLY EXIT: Check if final output exists =====
+        final_exists = False
+        print(f"  Checking for existing output at {output_path}...")
+        if output_format == "cog":
+            if not output_path.startswith(("abfs://", "az://", "s3://", "gs://")):
+                final_exists = os.path.exists(output_path) and os.path.getsize(output_path) > 1024
+            else:
+                final_exists = self.io_client.exists(output_path) if self.io_client else False
+                print(f"    COG output exists: {final_exists}")
+        else:  # zarr
+            if not output_path.startswith(("abfs://", "az://", "s3://", "gs://")):
+                # Check if zarr group has .zarray file
+                zarray_path = os.path.join(output_path, ".zarray")
+                final_exists = os.path.exists(zarray_path)
+            else:
+                final_exists = self.io_client.exists(output_path) if self.io_client else False
+                print(f"    Zarr output exists: {final_exists}")
+
+        if final_exists:
+            print(f"  ✓ Final output already exists: {output_path}")
+            print(f"  Skipping download for {section} on {date_str}")
+            return
 
         # Create temp directory for downloads
         if self.temp_download_dir:
@@ -412,159 +591,259 @@ class GeoanalyticsDownloader:
             temp_dir.mkdir(exist_ok=True)
             temp_dir_path = str(temp_dir)
         else:
-            import tempfile
-
             temp_dir_path = tempfile.mkdtemp(prefix=f"{section}_{date_str}_")
 
         downloaded_files: List[str] = []
+        metadata_files: List[str] = []
         bandnames: List[str] = []
 
-        # Get item metadata for attributes (needed early for hierarchical mode)
+        # Get item metadata
         item_id = item.id if hasattr(item, "id") else "unknown"
         cloud_pct = (
             item.properties.get("eo:cloud_cover", None)
             if hasattr(item, "properties")
             else None
         )
-
-        # For hierarchical mode, set up the store path early
-        store_path = None
-        scene_id = None
-        if use_hierarchical and output_format == "zarr":
-            scene_id = current_date.format("YYYYMMDD")
-            if self.zarr_store_path:
-                store_path = self.zarr_store_path
-            else:
-                store_filename = f"{section}_{self.aoi_name}_{resolution}m.zarr"
-                store_path = self._build_target_path(
-                    asset_savedir, anonym, "", store_filename
-                ).rstrip("/")
-
-            # Ensure local directory exists
-            if not store_path.startswith(("abfs://", "az://", "s3://", "gs://")):
-                os.makedirs(os.path.dirname(store_path) or ".", exist_ok=True)
+        geometry_info = self._extract_geometry_from_item(item, section)
 
         try:
-            print(f"  Downloading {len(matched_assets)} assets...")
+            print(f"  Downloading {len(matched_assets)} assets to temp...")
+
+            # Special handling for RGB visual assets
+            is_rgb_visual = section in ("S2_L2RGB", "LC08_L2RGB")
 
             for asset_key in matched_assets:
-                if asset_key.endswith("-jp2") or asset_key.endswith("-jpx"):
-                    print(
-                        f"    Skipping asset {asset_key} (JPEG2000 assets not supported for download)"
-                    )
-                    continue
-                if "RGB" in section.upper() and "visual" in asset_key:
-                    print(
-                        f"    Skipping asset {asset_key} (RGB assets not supported for download)"
-                    )
-                    continue
                 asset = item.assets[asset_key]
+
+                # Check if this is metadata
+                if self._is_metadata_asset(asset_key, asset):
+                    suffix = Path(asset.href).suffix or ".json"
+                    metadata_filename = f"{asset_key.replace('/', '_')}{suffix}"
+                    metadata_path = os.path.join(temp_dir_path, metadata_filename)
+                    try:
+                        self._copy_asset(asset.href, metadata_path, None, None, False)
+                        metadata_files.append(metadata_path)
+                        print(f"    Downloaded metadata: {metadata_filename}")
+                    except Exception as exc:
+                        print(f"    Failed to download metadata {asset_key}: {exc}")
+                    continue
+
+                # For RGB visual assets, download once and extract bands
+                if is_rgb_visual and asset_key == "visual":
+                    suffix = Path(asset.href).suffix or ".tif"
+                    temp_filename = f"visual{suffix}"
+                    temp_file_path = os.path.join(temp_dir_path, temp_filename)
+
+                    # Download visual asset using existing _copy_asset method
+                    if os.path.exists(temp_file_path) and os.path.getsize(temp_file_path) > 1024:
+                        print(f"    Using cached {asset_key}")
+                    else:
+                        print(f"    Downloading {asset_key} from {asset.href}")
+                        try:
+                            self._copy_asset(
+                                asset.href,
+                                temp_file_path,
+                                dtype=None,
+                                nodata=None,
+                                clip_aoi=False
+                            )
+                        except Exception as exc:
+                            print(f"    Failed to download {asset_key}: {exc}")
+                            continue
+
+                    # Extract individual RGB bands (R=1, G=2, B=3)
+                    try:
+                        with rasterio.open(temp_file_path) as src:
+                            profile = src.profile.copy()
+
+                            # Map band indices for RGB
+                            band_map = {"TCI_R": 1, "TCI_G": 2, "TCI_B": 3}
+
+                            for band_name in ["TCI_R", "TCI_G", "TCI_B"]:
+                                if band_name not in include_bands:
+                                    continue
+
+                                band_idx = band_map[band_name]
+                                if band_idx > src.count:
+                                    print(f"    Warning: Band {band_name} (index {band_idx}) not found in visual asset")
+                                    continue
+
+                                band_data = src.read(band_idx)
+
+                                # Save as separate file
+                                band_file = os.path.join(temp_dir_path, f"{band_name}.tif")
+                                profile.update(count=1)
+
+                                with rasterio.open(band_file, 'w', **profile) as dst:
+                                    dst.write(band_data, 1)
+
+                                downloaded_files.append(band_file)
+                                bandnames.append(_normalize_band_name(band_name))
+                                print(f"    ✓ Extracted {band_name} from visual asset")
+
+                    except Exception as exc:
+                        print(f"    Failed to extract bands from visual asset: {exc}")
+                        continue
+
+                    continue
+                # Raster asset - download to temp
                 suffix = Path(asset.href).suffix or ".tif"
-                # Ensure we're working with tif for merging
-                if suffix.lower() in (".jp2", ".jpx", ".jpeg2000"):
-                    suffix = ".tif"
+                temp_filename = f"{asset_key.replace('/', '_')}{suffix}"
+                temp_file_path = os.path.join(temp_dir_path, temp_filename)
 
-                local_filename = f"{asset_key.replace('/', '_')}{suffix}"
-                local_path = os.path.join(temp_dir_path, local_filename)
+                # Check if already in temp (cached from previous attempt)
+                if os.path.exists(temp_file_path) and os.path.getsize(temp_file_path) > 1024:
+                    print(f"    Using cached: {temp_filename}")
+                else:
+                    raster_bands = asset.extra_fields.get("raster:bands", [])
+                    raster_info = raster_bands[0] if raster_bands else {}
+                    dtype = raster_info.get("data_type")
+                    nodata = raster_info.get("nodata")
 
-                raster_bands = asset.extra_fields.get("raster:bands", [])
-                raster_info = raster_bands[0] if raster_bands else {}
-                dtype = raster_info.get("data_type")
-                nodata = raster_info.get("nodata")
+                    print(f"    Downloading: {asset_key}")
+                    try:
+                        self._copy_asset(
+                            asset.href,
+                            temp_file_path,
+                            dtype,
+                            nodata,
+                            clip_aoi,
+                        )
+                    except Exception as exc:
+                        print(f"    Failed to download {asset_key}: {exc}")
+                        continue
 
-                print(f"    Downloading {asset_key}...")
-                try:
-                    # Download to local temp file (convert to GeoTIFF in process)
-                    self._download_to_local(
-                        asset.href,
-                        local_path,
-                        dtype,
-                        nodata,
-                    )
-                    if (
-                        os.path.exists(local_path)
-                        and os.path.getsize(local_path) > 1024
-                    ):
-                        downloaded_files.append(local_path)
-                        bandnames.append(asset_key)
-
-                        # Hierarchical mode: write band to Zarr immediately after download
-                        if (
-                            use_hierarchical
-                            and output_format == "zarr"
-                            and self.write_individual_bands
-                        ):
-                            print(f"      Writing {asset_key} to Zarr...")
-                            try:
-                                write_band_to_zarr_group(
-                                    tif_path=local_path,
-                                    store_path=store_path,
-                                    group_path=f"{scene_id}/bands",
-                                    band_name=asset_key,
-                                    io_client=self.io_client,
-                                    chunks=(self.zarr_chunks[1], self.zarr_chunks[2]),
-                                    stac_item_id=item_id,
-                                    date=date_str,
-                                    cloud_cover=cloud_pct,
-                                )
-                            except Exception as band_exc:
-                                print(
-                                    f"      Warning: Failed to write band to Zarr: {band_exc}"
-                                )
-
-                except Exception as exc:
-                    print(f"      Failed to download {asset.href}: {exc}")
+                downloaded_files.append(temp_file_path)
+                bandnames.append(_normalize_band_name(asset_key))
 
             if not downloaded_files:
-                print(
-                    f"  No assets successfully downloaded for {section} on {date_str}"
-                )
+                print(f"  No raster assets downloaded for {section} on {date_str}")
                 return
 
-            # Hierarchical Zarr mode: now create the merged group from downloaded files
+            # Merge downloaded files
+            print(f"  Merging {len(downloaded_files)} files...")
+
             if use_hierarchical and output_format == "zarr":
-                print(f"  Creating merged group from {len(downloaded_files)} bands...")
-                # Determine clip_bbox for this operation
-                clip_bbox = self.bbox if clip_aoi else None
-                try:
-                    write_merged_to_zarr_group(
-                        tif_files=downloaded_files,
-                        store_path=store_path,
-                        group_path=f"{scene_id}/merged",
-                        io_client=self.io_client,
-                        bandnames=bandnames,
-                        chunks=self.zarr_chunks,
-                        clip_bbox=clip_bbox,
-                        stac_item_id=item_id,
-                        date=date_str,
-                        cloud_cover=cloud_pct,
-                        aoi=self.aoi_name,
-                        resolution=resolution,
-                    )
-                    print(f"  Successfully ingested scene to {store_path}/{scene_id}/")
-                except Exception as exc:
-                    print(f"  Failed to create merged group: {exc}")
-                    raise
-            else:
-                # Original mode: separate file per scene
-                self._merge_to_single_file(
-                    section=section,
-                    downloaded_files=downloaded_files,
-                    bandnames=bandnames,
-                    asset_savedir=asset_savedir,
-                    anonym=anonym,
-                    current_date=current_date,
-                    resolution=resolution,
-                    output_format=output_format,
-                    item_id=item_id,
-                    cloud_pct=cloud_pct,
-                    clip_aoi=clip_aoi,
+                # Hierarchical Zarr: write each band then merged
+                if not store_path.startswith(("abfs://", "az://", "s3://", "gs://")):
+                    os.makedirs(os.path.dirname(store_path) or ".", exist_ok=True)
+
+                store, root = open_or_create_zarr_store(
+                    store_path,
+                    scene_id,
+                    self.io_client,
+                    self.zarr_chunks,
+                    self.zarr_compression_type,
+                    self.zarr_compression_level,
                 )
+
+                # Write individual bands
+                for band_file, band_name in zip(downloaded_files, bandnames):
+                    with rasterio.open(band_file) as src:
+                        write_band_to_zarr_group(
+                            root[scene_id],
+                            band_name,
+                            src.read(1),
+                            src.profile,
+                        )
+
+                # Write merged multi-band array
+                with rasterio.open(downloaded_files[0]) as src:
+                    profile = src.profile.copy()
+
+                write_merged_to_zarr_group(
+                    root[scene_id],
+                    downloaded_files,
+                    bandnames,
+                    profile,
+                )
+
+                # Add geometry metadata
+                self._add_geometry_to_zarr(store_path, scene_id, geometry_info, item_id)
+
+                print(f"  ✓ Wrote scene {scene_id} to hierarchical Zarr: {store_path}")
+
+            elif output_format == "zarr":
+                # Single-scene Zarr
+                if not output_path.startswith(("abfs://", "az://", "s3://", "gs://")):
+                    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+                merge_downloaded_assets_to_zarr(
+                    downloaded_files,
+                    bandnames,
+                    output_path,
+                    self.io_client,
+                    self.zarr_chunks,
+                    self.zarr_compression_type,
+                    self.zarr_compression_level,
+                )
+                print(f"  ✓ Merged to Zarr: {output_path}")
+
+            else:
+                # COG format
+                if not output_path.startswith(("abfs://", "az://", "s3://", "gs://")):
+                    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+                merge_downloaded_assets_to_cog(
+                    downloaded_files,
+                    bandnames,
+                    output_path,
+                    self.io_client, )
+
+                # Add geometry metadata to COG
+                self._add_geometry_to_cog(output_path, geometry_info, item_id)
+
+                print(f"  ✓ Merged to COG: {output_path}")
+
+        except Exception as e:
+            print(f"  Error processing {section} on {date_str}: {e}")
+            raise
 
         finally:
             # Clean up temp directory
             if os.path.exists(temp_dir_path):
-                shutil.rmtree(temp_dir_path, ignore_errors=True)
+                shutil.rmtree(temp_dir_path)
+                print(f"  Cleaned up temp: {temp_dir_path}")
+
+    def _download_metadata_file(self, href: str, local_path: str) -> None:
+        """Download metadata file (XML/JSON/TXT) from HTTP(S) or S3."""
+        import urllib.request
+        import urllib.parse
+        try:
+            # Check if it's an S3 URL
+            if href.startswith('s3://'):
+                # Parse S3 URL: s3://bucket/key
+                parsed = urllib.parse.urlparse(href)
+                bucket = parsed.netloc
+                key = parsed.path.lstrip('/')
+
+                # Try using boto3 for S3 downloads
+                try:
+                    import boto3
+                    from botocore import UNSIGNED
+                    from botocore.config import Config
+
+                    # Try anonymous access first (for public buckets)
+                    s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+                    s3.download_file(bucket, key, local_path)
+
+                except Exception as boto_error:
+                    print(f"      Boto3 download failed: {boto_error}")
+                    print(f"      Attempting HTTPS fallback...")
+
+                    # Fallback to HTTPS
+                    https_url = f"https://{bucket}.s3.amazonaws.com/{key}"
+                    with urllib.request.urlopen(https_url) as response:
+                        with open(local_path, 'wb') as out_file:
+                            out_file.write(response.read())
+            else:
+                # Regular HTTP(S) URL
+                with urllib.request.urlopen(href) as response:
+                    with open(local_path, 'wb') as out_file:
+                        out_file.write(response.read())
+
+        except Exception as e:
+            raise Exception(f"Failed to download {href}: {e}")
 
     def _merge_to_single_file(
             self,
@@ -640,9 +919,12 @@ class GeoanalyticsDownloader:
         import fsspec
         import rioxarray as rxr
 
+        # Check if this is a metadata file (XML/JSON/TXT)
+        href_lower = href.lower()
+        is_metadata = href_lower.endswith((".xml", ".json", ".txt", ".html", ".htm"))
+
         # Determine storage options based on URL scheme
         if self.output_mode == "local":
-            # For S3 URLs, use anonymous access for public buckets
             if href.startswith("s3://"):
                 reader_opts = {"anon": True}
             else:
@@ -650,20 +932,19 @@ class GeoanalyticsDownloader:
         else:
             reader_opts = self.io_client._storage_options(href)
 
+        # For metadata files, download directly without raster processing
+        if is_metadata:
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with fsspec.open(href, "rb", **reader_opts) as reader_file:
+                with open(local_path, "wb") as writer_file:
+                    writer_file.write(reader_file.read())
+            return
+
+        # For raster files, use rioxarray
         with fsspec.open(href, "rb", **reader_opts) as reader_file:
             with rxr.open_rasterio(reader_file) as dataset:
-                # Handle nodata and dtype
-                if nodata is not None:
-                    dataset = dataset.rio.set_nodata(nodata)
-                    dataset = dataset.rio.write_nodata(nodata, encoded=True)
-                if dtype:
-                    dataset = dataset.astype(dtype)
-
-                # Ensure output directory exists
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-                # Write as GeoTIFF
-                dataset.rio.to_raster(local_path, driver="GTiff")
+                dataset.rio.to_raster(local_path, driver="GTiff", compress="LZW")
 
     def _find_stac_item(self, collection: str, date: pendulum.DateTime):
         period = f"{date.format('YYYY-MM-DD')}/{date.add(days=1).format('YYYY-MM-DD')}"
@@ -862,8 +1143,20 @@ class GeoanalyticsDownloader:
 
     def _match_assets(self, section: str, item, include_bands: List[str]) -> List[str]:
         """Resolve configured band names to available STAC asset keys for a dataset."""
+        # Check if metadata should be included
+        include_metadata = False
+        if section in self.config:
+            include_metadata_str = self.config[section].get("include_metadata", "false")
+            include_metadata = include_metadata_str.lower() == "true"
+
+        # If no bands specified, return all (optionally filtered)
         if not include_bands:
-            return list(item.assets.keys())
+            if include_metadata:
+                return list(item.assets.keys())
+            return [
+                key for key, asset in item.assets.items()
+                if not self._is_metadata_asset(key, asset)
+            ]
 
         alias_map = self._build_asset_alias_map(section, item)
         matches: List[str] = []
@@ -871,47 +1164,89 @@ class GeoanalyticsDownloader:
 
         for band in include_bands:
             normalized = _normalize_band_name(band)
+
+            # Skip visual bands for non-RGB sections
             if "visual" in normalized and "RGB" not in section.upper():
                 continue
+
+            # Get matching asset names from alias map
             for asset_name in alias_map.get(normalized, []):
+                # Skip JP2 formats
                 if asset_name.endswith("-jp2") or asset_name.endswith("-jpx"):
                     continue
+
+                # Skip visual assets for non-RGB sections
                 if "RGB" not in section.upper() and (
-                    "visual" in asset_name or "visual" in normalized
+                        asset_name.lower().startswith("visual") or asset_name.lower() == "rendered_preview"
                 ):
                     continue
-                if asset_name not in seen:
+
+                # Check if metadata asset
+                is_meta = self._is_metadata_asset(asset_name, item.assets.get(asset_name))
+
+                # Add if not duplicate and not metadata (metadata added separately below)
+                if asset_name not in seen and not is_meta:
                     matches.append(asset_name)
                     seen.add(asset_name)
 
-        if matches:
-            return matches
+        # Add metadata assets if requested
+        if include_metadata:
+            for asset_name, asset in item.assets.items():
+                if self._is_metadata_asset(asset_name, asset) and asset_name not in seen:
+                    matches.append(asset_name)
+                    seen.add(asset_name)
 
-        return list(item.assets.keys())
+        return matches
 
-    def _load_aoi_bbox(self, path: str) -> List[float]:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        features = []
-        if data.get("type") == "FeatureCollection":
-            features = data.get("features", [])
-        elif data.get("type") == "Feature":
-            features = [data]
+        # Fallback
+        if include_metadata:
+            return list(item.assets.keys())
+        return [
+            key for key in item.assets.keys()
+            if not self._is_metadata_asset(key, item.assets[key])
+        ]
+
+    #def _load_aoi_bbox(self, path: str) -> List[float]:
+    #    with open(path, "r", encoding="utf-8") as fh:
+    #        data = json.load(fh)
+    #    features = []
+    #    if data.get("type") == "FeatureCollection":
+    #        features = data.get("features", [])
+    #    elif data.get("type") == "Feature":
+    #        features = [data]
+    #    else:
+    #        raise ValueError("AOI GeoJSON must contain a Feature or FeatureCollection")
+
+    #    x_values: list[float] = []
+    #    y_values: list[float] = []
+    #    for feature in features:
+    #        geometry = feature.get("geometry")
+    #        if not geometry:
+    #            continue
+    #        self._accumulate_coords(geometry, x_values, y_values)
+
+    #   if not x_values or not y_values:
+    #        raise ValueError("AOI geometry did not contain coordinates")
+
+    #    return [min(x_values), min(y_values), max(x_values), max(y_values)]
+
+    def _load_aoi_bbox(self, aoi_path: str) -> List[float]:
+        """
+        Load the bounding box from an AOI file (GeoJSON or Shapefile).
+        For shapefiles, returns the total bounds of all features.
+        Returns [minx, miny, maxx, maxy] in WGS84.
+        """
+        import geopandas as gpd
+
+        if aoi_path.startswith(("abfs://", "az://")):
+            # Cloud storage
+            gdf = self.io_client.load_remote_aoi_gdf(aoi_path)
         else:
-            raise ValueError("AOI GeoJSON must contain a Feature or FeatureCollection")
+            # Local file - handle both GeoJSON and Shapefile
+            gdf = gpd.read_file(aoi_path)
 
-        x_values: list[float] = []
-        y_values: list[float] = []
-        for feature in features:
-            geometry = feature.get("geometry")
-            if not geometry:
-                continue
-            self._accumulate_coords(geometry, x_values, y_values)
-
-        if not x_values or not y_values:
-            raise ValueError("AOI geometry did not contain coordinates")
-
-        return [min(x_values), min(y_values), max(x_values), max(y_values)]
+        # Get total bounds of all geometries
+        return list(gdf.total_bounds)
 
     def _accumulate_coords(
         self, geometry: dict, x_values: List[float], y_values: List[float]
@@ -966,12 +1301,12 @@ class GeoanalyticsDownloader:
 
         # Check if save_dir is local or cloud
         if self.save_dir.startswith(("abfs://", "az://", "s3://", "gs://")):
-            # Cloud storage path
-            base = f"abfs://{ADLS_PREFIX}/{normalized_dir}/{anonym}/{date_token}"
+            # Cloud storage path - include polygon name
+            base = f"abfs://{ADLS_PREFIX}/{normalized_dir}/{anonym}/{self.aoi_name}/{date_token}"
             return f"{base}/{filename}"
         else:
-            # Local storage path
-            base = os.path.join(self.save_dir, normalized_dir, anonym, date_token)
+            # Local storage path - include polygon name
+            base = os.path.join(self.save_dir, normalized_dir, anonym, self.aoi_name, date_token)
             os.makedirs(base, exist_ok=True)
             return os.path.join(base, filename)
 

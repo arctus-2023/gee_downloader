@@ -254,3 +254,12 @@ class GeoanalyticsIOClient:
             if parent:
                 os.makedirs(parent, exist_ok=True)
         return options
+
+    def load_remote_aoi_gdf(self, remote_path: str) -> gpd.GeoDataFrame:
+        """Load a GeoJSON or shapefile from cloud storage into a GeoDataFrame."""
+        import fsspec
+        import geopandas as gpd
+
+        storage_opts = self._storage_options(remote_path)
+        with fsspec.open(remote_path, "rb", **storage_opts) as f:
+            return gpd.read_file(f)
