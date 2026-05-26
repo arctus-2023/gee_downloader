@@ -12,4 +12,7 @@ dependencies:
   - plumbum
   - gdal
   - pendulum
-  # - db_dtypes # this package needs to be installed using pip install
+  - pip
+  - pip:
+      # works for regular pip packages
+      - db_dtypes # this package needs to be installed using pip install

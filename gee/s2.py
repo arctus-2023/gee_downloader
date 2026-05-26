@@ -384,9 +384,11 @@ def get_obsgeo(pickle_file):
         query_str = (
                     'SELECT granule_id,product_id,base_url,source_url,north_lat,south_lat,west_lon,east_lon FROM `bigquery-public-data.cloud_storage_geo_index.sentinel_2_index`'
                     'WHERE product_id = ' + f'"{proid}"')
+        print(query_str)
         try:
             query_job = client.query(query_str)  # API request
             rows_df = query_job.result().to_dataframe()  # Waits for query to finish
+            print(rows_df)
         except Exception as e:
             print(e)
             print("try---> gcloud auth application-default login; pip install db_types")
@@ -396,6 +398,7 @@ def get_obsgeo(pickle_file):
             raise NoEEImageFoundError(ee_source=query_str,date='')
 
         base_url = rows_df.iloc[0]['base_url']
+        print(base_url)
         granule_id = rows_df.iloc[0]['granule_id']
         if base_url is None:
             base_url = rows_df.iloc[0]['source_url'] ## for some data, the URL is stored in the column of 'source_url'
@@ -404,6 +407,7 @@ def get_obsgeo(pickle_file):
         # manifest_safe_url = f'{base_url}/manifest.safe'
         # mtd_msil1c_xml_url = f'{base_url}/MTD_MSIL1C.xml'
         mtd_tl_xml_url = f'{base_url}/GRANULE/{granule_id}/MTD_TL.xml'
+        print(mtd_tl_xml_url)
         os.system(f'gsutil -m cp -r {mtd_tl_xml_url} {mtd_tl_xml_file}')
         if not os.path.exists(mtd_tl_xml_file):
             raise GsutilError(f'failed: gsutil -m cp -r {mtd_tl_xml_url} {mtd_tl_xml_file}')
